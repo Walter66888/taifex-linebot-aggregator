@@ -5,12 +5,12 @@ crawler/pc_ratio.py
 欄位：date, put_volume, call_volume, pc_volume_ratio,
       put_oi, call_oi, pc_oi_ratio
 """
-import io, sys, requests, pandas as pd
+import io, sys, re, requests, pandas as pd
 from datetime import datetime, timezone, timedelta
 from utils.db import get_col
 
 URL = "https://www.taifex.com.tw/cht/3/pcRatioExcel"
-HEADERS = {"User-Agent": "Mozilla/5.0 (pc-ratio-crawler/1.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (pc-ratio-crawler/1.1)"}
 COL = get_col("pc_ratio")
 
 EXPECTED_COLS = [
@@ -24,30 +24,30 @@ EXPECTED_COLS = [
 ]
 
 def _parse(text: str) -> pd.DataFrame:
-    """同時支援空白或逗號分隔格式。"""
-    import re, io, pandas as pd
+    """同時支援空白或逗號分隔格式，並自動定位第一行資料。"""
+    # 移除空行與左右空白
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    # 定位第一行資料（以 YYYY/ 開頭）
-    start = next(i for i, l in enumerate(lines) if re.match(r"^20\d{2}/", l))
-        data = "
-".join(lines[start:])lines[start:])
+    # 找到第一行以 YYYY/ 開頭的位置
+    try:
+        start_idx = next(i for i, l in enumerate(lines) if re.match(r"^20\\d{2}/", l))
+    except StopIteration:
+        raise ValueError("無法找到日期開頭的資料行，網站格式可能變動")
 
-    # 判斷分隔符號
-    sample = lines[start]
-    if "," in sample:
-        sep = ","
-    else:
-        sep = r"\s+"
+    data_str = "\n".join(lines[start_idx:])
+    sample_line = lines[start_idx]
+    sep = "," if "," in sample_line else r"\\s+"
 
     df = pd.read_csv(
-        io.StringIO(data),
+        io.StringIO(data_str),
         sep=sep,
         engine="python",
         header=None,
         thousands=",",
     )
+
     if df.shape[1] != 7:
-        raise ValueError(f"Unexpected columns: {df.shape[1]}")
+        raise ValueError(f"Unexpected column count: {df.shape[1]}")
+
     df.columns = EXPECTED_COLS
     df["date"] = pd.to_datetime(df["date"], format="%Y/%m/%d", utc=True)
     df[df.columns[1:]] = df[df.columns[1:]].apply(pd.to_numeric, downcast="integer")
