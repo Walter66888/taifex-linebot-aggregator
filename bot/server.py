@@ -1,23 +1,22 @@
 """
-bot/server.py  v2.3
--------------------
-LINE Bot 服務
+bot/server.py  v2.4
+───────────────────
+LINE Bot 服務 + /debug JSON 端點
 
-指令
-────
-/today         今日 PC‑ratio + 散戶小台/微台未平倉
-/reset_fut     **管理員**：刪除 fut_contracts → 立即重抓
-/show_indexes  **管理員**：列出 fut_contracts 現有索引
+公開指令
+  /today         今日 PC‑ratio & 散戶小台/微台未平倉
 
-環境變數
-────────
-LINE_CHANNEL_SECRET
-LINE_CHANNEL_ACCESS_TOKEN
-ADMIN_USER_IDS          # 逗號分隔的 user_id 白名單
+管理員指令
+  /reset_fut     刪除 fut_contracts → 立即重抓
+  /show_indexes  顯示 fut_contracts 索引
+
+調試端點（HTTP GET）
+  /debug?col=fut&token=<ADMIN_ID>   # 最新 fut_contracts 10 筆
+  /debug?col=pc&token=<ADMIN_ID>    # 最新 pc_ratio      10 筆
 """
 
 import os, json, logging, traceback
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -33,7 +32,7 @@ line_api = LineBotApi(os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
 handler  = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
 ADMIN_IDS = set(filter(None, os.getenv("ADMIN_USER_IDS", "").split(",")))
 
-# ── Helper ────────────────────────────────────────────
+# ── 共用工具 ───────────────────────────────────────────
 def is_admin(uid: str) -> bool:
     return uid in ADMIN_IDS
 
@@ -52,7 +51,7 @@ def build_report() -> str:
         f"微台：{safe_latest('imtx')}"
     )
 
-# ── Flask route ───────────────────────────────────────
+# ── LINE Webhook ──────────────────────────────────────
 @app.route("/callback", methods=["POST"])
 def callback():
     body      = request.get_data(as_text=True)
@@ -63,14 +62,13 @@ def callback():
         abort(400, "Bad signature")
     return "OK"
 
-# ── LINE Event Handler ────────────────────────────────
 @handler.add(MessageEvent, message=TextMessage)
 def on_message(event: MessageEvent):
     uid  = event.source.user_id
     text = event.message.text.strip().lower()
     logging.info(f"[LINE] {uid} -> {text}")
 
-    # ── 公開指令 ──
+    # ── 公開 ──
     if text == "/today":
         line_api.reply_message(event.reply_token, TextSendMessage(build_report()))
         return
@@ -80,7 +78,7 @@ def on_message(event: MessageEvent):
         line_api.reply_message(event.reply_token, TextSendMessage("可用指令：/today"))
         return
 
-    # ── 管理員指令 ──
+    # ── 管理員 ──
     if text == "/reset_fut":
         try:
             get_col("fut_contracts").drop()
@@ -103,6 +101,30 @@ def on_message(event: MessageEvent):
         TextSendMessage("管理指令：/reset_fut /show_indexes /today")
     )
 
-# ── Local run ─────────────────────────────────────────
+# ── 調試 JSON 端點 ─────────────────────────────────────
+@app.route("/debug")
+def debug_dump():
+    token = request.args.get("token", "")
+    col   = request.args.get("col", "fut").lower()
+
+    if token not in ADMIN_IDS:
+        return jsonify({"error": "unauthorized"}), 403
+
+    if col == "fut":
+        docs = list(get_col("fut_contracts")
+                    .find({}, {"_id": 0})
+                    .sort("date", -1)
+                    .limit(10))
+    elif col == "pc":
+        docs = list(get_col("pc_ratio")
+                    .find({}, {"_id": 0})
+                    .sort("date", -1)
+                    .limit(10))
+    else:
+        return jsonify({"error": "unknown col"}), 400
+
+    return jsonify(docs)
+
+# ── 本機測試 ───────────────────────────────────────────
 if __name__ == "__main__":
     app.run(port=8000, debug=True)
