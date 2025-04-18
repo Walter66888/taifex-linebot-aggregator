@@ -1,14 +1,13 @@
 """
-crawler/fut_contracts.py  v3.3.2
+crawler/fut_contracts.py  v3.3.3
 --------------------------------
 抓取 https://www.taifex.com.tw/cht/3/futContractsDateExcel
 同步寫入 2 商品：小型臺指期貨(mtx)、微型臺指期貨(imtx)
 
-‣ 特色
-  1. 逐 <tr> 掃描，鎖定「倒數第 2 個數字欄」= 未平倉多空淨額(口數)
-  2. ROLE_MAP / TARGETS 全半形 + 變體容錯
-  3. 自動遷移舊索引：刪除所有『只含 date 欄位且 unique』的索引，
-     並建立 (date, product) 複合唯一索引
+✦ 特點
+  1. 逐 <tr> 掃描，鎖定「倒數第 2 個數字欄」＝未平倉多空淨額(口數)
+  2. ROLE_MAP / TARGETS 全半形與變體容錯
+  3. 自動遷移索引：刪除任何「僅含 date 欄位」索引 → 建 (date, product) 複合唯一索引
   4. 抓不到三法人齊全 ⇒ neutral exit，不 raise
 
 依賴：beautifulsoup4、lxml、pymongo
@@ -27,7 +26,7 @@ from utils.db import get_col
 
 # ── 常量設定 ──────────────────────────────────────────────
 URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-HEAD = {"User-Agent": "Mozilla/5.0 (fut-contracts-crawler/3.3.2)"}
+HEAD = {"User-Agent": "Mozilla/5.0 (fut-contracts-crawler/3.3.3)"}
 
 TARGETS = {
     "小型臺指期貨": "mtx",
@@ -51,11 +50,13 @@ COL = get_col("fut_contracts")
 
 def ensure_index(col):
     """
-    • 刪除所有『只含 date 欄位且 unique』的舊索引（名稱可能不固定）
+    • 刪除任何『只含 date 欄位』索引 (不論名稱/unique 與否)
     • 建立 (date, product) 複合唯一索引
     """
     for name, spec in col.index_information().items():
-        if spec.get("unique") and list(spec["key"]) == [("date", 1)]:
+        if name == "_id_":
+            continue
+        if [k for k, _ in spec["key"]] == ["date"]:
             col.drop_index(name)
 
     if "date_1_product_1" not in col.index_information():
@@ -82,7 +83,7 @@ def _extract_net(nums: list[str]) -> int | None:
 def parse(html: str) -> list[dict]:
     soup = bs.BeautifulSoup(html, "lxml")
 
-    # ① 日期
+    # ① 解析日期
     span = soup.find(string=DATE_RE)
     if not span:
         raise ValueError("找不到日期")
@@ -94,7 +95,7 @@ def parse(html: str) -> list[dict]:
     results = {v: {"date": date_dt, "product": v} for v in TARGETS.values()}
     current_prod: str | None = None
 
-    # ③ 逐列掃描
+    # ③ 逐 <tr> 掃描
     for tr in soup.select("tbody tr"):
         raw   = [td.get_text(strip=True) for td in tr.find_all("td")]
         cells = [c.replace(",", "").replace("口", "") for c in raw]
@@ -156,6 +157,7 @@ def fetch(upsert: bool = True):
     print(f"更新 {len(docs)} 商品 fut_contracts → MongoDB")
     return docs
 
+# ── 快速查詢 ─────────────────────────────────────────────
 def latest(product="mtx", days: int = 1):
     return list(
         COL.find({"product": product}, {"_id": 0})
@@ -163,7 +165,7 @@ def latest(product="mtx", days: int = 1):
            .limit(days)
     )
 
-# ── CLI ─────────────────────────────────────────────────
+# ── CLI 用途 ─────────────────────────────────────────────
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "run":
