@@ -1,145 +1,93 @@
 # -*- coding: utf-8 -*-
 """
-fut_contracts.py  v3.6  2025‑04‑18
-----------------------------------
-抓「三大法人－區分各期貨契約」網頁，
-只萃取『小型臺指期貨‧微型臺指期貨』的
-　┌─ 自營商(prop)  投信(itf)  外資(foreign)
-　└─ 未平倉多空淨額(口數)  ➜ retail = ‑(prop+itf+foreign)
-
-廉價但可靠的抓法：
-1. 每一個法人 row 固定含 15 個 <td>；第 3 欄起有 12 個純數字欄位
-   index 10 (=第 11 欄) 永遠是「未平倉多空淨額－口數」。
-   只要取它即可，不再去動態比對表頭文字，避免抓錯欄。
-2. 以『商品名稱』判斷產品、以『身份別』判斷法人，累加完一次就停。
-3. 建立 (date, product) 複合唯一索引 → 不會再撞 DuplicateKey。
-
-──────────────────────────────────────────
+fut_contracts.py  v3.9.1
+------------------------
+• 修正 .12bk 選擇器 → 以 Python 方式過濾 class
+    rows = [tr for tr in soup.select("tbody tr") if '12bk' in tr.get('class', [])]
+其餘邏輯與 v3.9 相同。
 """
+
 from __future__ import annotations
-
-import datetime as _dt
-import re
-import logging
-from typing import Dict, List
-
+import re, sys, logging
+from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
-import pymongo                                    # type: ignore
+import pymongo
 
 from utils.db import get_col
 
-_URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+URL  = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+HEAD = {"User-Agent": "taifex-fut-crawler/3.9.1"}
 
-# ── Mongo ──────────────────────────────────────────────────────────
-COL = get_col("fut_contracts")
-# 只建立一次即可；若已存在 PyMongo 會吞掉 DuplicateKeyError
-COL.create_index([("date", 1), ("product", 1)], unique=True)
-
-# ── 表格->程式 轉換表 ────────────────────────────────────────────────
-IDENT_MAP = {"自營商": "prop", "投信": "itf", "外資": "foreign"}
-PRODUCT_CODE = {
-    "小型臺指期貨": "mtx",
-    "微型臺指期貨": "imtx",
+TARGETS = {
+    "小型臺指期貨": "mtx", "小型台指期貨": "mtx",
+    "微型臺指期貨": "imtx","微型台指期貨": "imtx",
+}
+ROLE_MAP = {
+    "自營商": "prop_net", "自營商(避險)": "prop_net",
+    "投信":   "itf_net",
+    "外資":   "foreign_net", "外資及陸資": "foreign_net",
 }
 
-_NUM_RE = re.compile(r"[-\d,]+")
+DATE_RE = re.compile(r"日期\s*(\d{4}/\d{1,2}/\d{1,2})")
+NUM     = lambda s:int(s.replace(",","")) if s and s.replace(",","").lstrip("-").isdigit() else 0
+FALLBACK_IDX = 10
 
+COL = get_col("fut_contracts")
+COL.create_index([("date",1),("product",1)], unique=True)
 
-def _int(txt: str) -> int:
-    """把 '8,551' → 8551 , '‑3,048' → -3048 , 其它 → 0"""
-    m = _NUM_RE.search(txt.strip().replace("—", "0"))
-    return int(m.group(0).replace(",", "")) if m else 0
+def today_tw(): return datetime.now(timezone(timedelta(hours=8))).date()
 
+def _oi_net_idx(soup: BeautifulSoup) -> int:
+    for th in soup.select("thead th"):
+        txt = th.get_text(strip=True).replace("　","").replace(" ","")
+        if txt.startswith("未平倉餘額"):
+            ths=list(th.parent.find_all("th"))
+            for i,t in enumerate(ths):
+                if t.get_text(strip=True).replace("　","").replace(" ","")=="多空淨額":
+                    return (i*2)+2
+    return FALLBACK_IDX
 
-# ── 解析 html ──────────────────────────────────────────────────────
-def _date_from_html(html: str) -> _dt.datetime:
-    m = re.search(r"日期\s*(\d{4}/\d{2}/\d{2})", html)
-    if not m:
-        raise ValueError("抓不到日期")
-    return _dt.datetime.strptime(m.group(1), "%Y/%m/%d")
+def parse(html:str):
+    soup=BeautifulSoup(html,"lxml")
+    date_dt=datetime.strptime(DATE_RE.search(soup.text).group(1),"%Y/%m/%d").replace(tzinfo=timezone.utc)
+    idx=_oi_net_idx(soup)
 
-
-def parse(html: str) -> List[dict]:
-    soup = BeautifulSoup(html, "lxml")
-    rows = soup.select("tbody tr.12bk")
-
-    prod_stats: Dict[str, Dict[str, int]] = {}   # {code: {prop, itf, foreign}}
+    res={v:{"date":date_dt,"product":v,"prop_net":0,"itf_net":0,"foreign_net":0} for v in TARGETS.values()}
+    cur=None
+    rows=[tr for tr in soup.select("tbody tr") if "12bk" in tr.get("class", [])]
 
     for tr in rows:
-        tds = tr.find_all("td")
-        if len(tds) < 15:                # 保險：不是數字列就跳過
-            continue
+        tds=[td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(tds)<15: continue
 
-        prod_name = tds[1].get_text(strip=True)
-        if prod_name not in PRODUCT_CODE:
-            continue
+        if len(tds)>1 and tds[1] in TARGETS:
+            cur = TARGETS[tds[1]]
+        if cur is None: continue
 
-        identity = tds[2].get_text(strip=True)
-        role = IDENT_MAP.get(identity)
-        if role is None:
-            continue
+        role = tds[2] if len(tds)>=3 and tds[2] in ROLE_MAP else tds[0] if tds[0] in ROLE_MAP else None
+        if role not in ROLE_MAP or idx>=len(tds): continue
 
-        nums = [_int(td.get_text()) for td in tds[3:]]   # 12 個純數字欄
-        if len(nums) < 11:
-            continue
-        net_lots = nums[10]               # ← 位置固定
+        res[cur][ROLE_MAP[role]] = NUM(tds[idx])
 
-        code = PRODUCT_CODE[prod_name]
-        prod_stats.setdefault(code, {"prop": 0, "itf": 0, "foreign": 0})[role] = net_lots
-
-        # 若三法人都到齊了就可以提早結束迴圈，節省解析時間
-        if all(k in prod_stats[code] and isinstance(prod_stats[code][k], int)
-               for k in ("prop", "itf", "foreign")) and len(prod_stats) == len(PRODUCT_CODE):
-            pass  # 不 break，保險起見還是走完整個 tbody
-
-    if not prod_stats:
-        raise RuntimeError("找不到任何目標商品資料")
-
-    date = _date_from_html(html)
-    docs = []
-    for code, st in prod_stats.items():
-        retail = -(st["prop"] + st["itf"] + st["foreign"])
-        docs.append(
-            {
-                "date": date,
-                "product": code,
-                "prop_net": st["prop"],
-                "itf_net": st["itf"],
-                "foreign_net": st["foreign"],
-                "retail_net": retail,
-            }
-        )
-    return docs
-
-
-# ── 抓網頁 + 寫入 Mongo ─────────────────────────────────────────────
-def fetch() -> List[dict]:
-    logging.info("[fut_contracts] fetching taifex html…")
-    res = requests.get(_URL, timeout=15)
-    res.encoding = "utf-8"
-    docs = parse(res.text)
-
-    ops = [
-        pymongo.UpdateOne(
-            {"date": d["date"], "product": d["product"]},
-            {"$set": d},
-            upsert=True,
-        )
-        for d in docs
+    return [
+        {**d,"retail_net":-(d["prop_net"]+d["itf_net"]+d["foreign_net"])}
+        for d in res.values()
     ]
-    if ops:
-        COL.bulk_write(ops, ordered=False)
-    logging.info("[fut_contracts] upsert %s docs", len(docs))
+
+def fetch():
+    html=requests.get(URL,headers=HEAD,timeout=30).text
+    docs=parse(html)
+    if docs[0]["date"].date()<today_tw():
+        logging.warning("fut_contracts 未更新"); sys.exit(75)
+
+    ops=[pymongo.UpdateOne({"date":d["date"],"product":d["product"]},{"$set":d},upsert=True) for d in docs]
+    COL.bulk_write(ops,ordered=False)
+    logging.info("fut_contracts upsert %s docs", len(docs))
     return docs
 
+def latest(prod:str="mtx",days:int=1):
+    return list(COL.find({"product":prod},{"_id":0}).sort("date",-1).limit(days))
 
-# ── 查詢最近資料 (給 bot 用) ──────────────────────────────────────────
-def latest(product: str, limit: int = 1) -> List[dict]:
-    return list(COL.find({"product": product}).sort("date", -1).limit(limit))
-
-
-if __name__ == "__main__":
-    from pprint import pprint
-
-    pprint(fetch())
+if __name__=="__main__":
+    from pprint import pprint; pprint(fetch())
