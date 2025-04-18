@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TAIFEX ‑ 三大法人各期貨契約
-抓小型臺指(mtx)、微型臺指(imtx) ‑『未平倉多空淨額‧口數』
+抓小型臺指(mtx)、微型臺指(imtx) ― 未平倉多空淨額(口數)
 """
 
 import datetime as dt
@@ -13,7 +13,7 @@ import bs4
 import requests
 from pymongo import UpdateOne
 
-from utils.db import get_col          # 你的 DB 封裝
+from utils.db import get_col
 
 URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
 COL = get_col("fut_contracts")
@@ -43,18 +43,21 @@ def parse(html: str) -> List[Dict]:
     soup = bs4.BeautifulSoup(html, "lxml")
     date = _trade_date(soup)
 
-    rows = soup.find_all("tr", class_="12bk")      # ← 不用 CSS selector
+    rows = soup.find_all("tr", class_="12bk")
     docs: List[Dict] = []
 
     i = 0
     while i < len(rows):
-        # 每 3 列為 1 商品
         r_prop, r_itf, r_for = rows[i : i + 3]
-        tds_prop = r_prop.find_all("td")
-        prod_name = tds_prop[1].get_text(strip=True)
 
+        tds_prop = r_prop.find_all("td")
+        if len(tds_prop) < 14:        # 分隔列或格式異常 → 跳過
+            i += 1
+            continue
+
+        prod_name = tds_prop[1].get_text(strip=True)
         prod = MAP_PROD.get(prod_name)
-        if prod:                                   # 只處理 mtx/imtx
+        if prod:
             prop_net    = _row_net(tds_prop)
             itf_net     = _row_net(r_itf.find_all("td"))
             foreign_net = _row_net(r_for.find_all("td"))
