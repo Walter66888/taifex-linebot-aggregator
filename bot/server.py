@@ -1,158 +1,87 @@
 """
-crawler/fut_contracts.py  v3.3.6
---------------------------------
-抓取 https://www.taifex.com.tw/cht/3/futContractsDateExcel
-同步寫入 2 商品：小型臺指期貨 (mtx)、微型臺指期貨 (imtx)
-
-最後修正：
-• ensure_index() → *鐵血版*：凡是 **唯一鍵集合只含 'date'** 的索引全部刪除  
-  ‑ 無論 PyMongo 版本、keys 型別(list[tuple]/list[list]/list[dict])、名稱、複本  
-• 其餘邏輯保持 v3.3.5
+bot/server.py  v2.2
+-------------------
+功能
+• /today       → 今日 PC ratio ＋ 散戶小台 / 微台未平倉
+• /reset_fut   → 管理員：清空 fut_contracts 並即時重抓
+• /show_indexes→ 管理員：顯示 fut_contracts 索引
 """
 
-from __future__ import annotations
-import re, sys
-from datetime import datetime, timezone, timedelta
+import os, json, logging
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-import bs4 as bs
-import requests
-from pymongo import ASCENDING, UpdateOne
+from crawler.pc_ratio import latest as pc_latest
+from crawler.fut_contracts import latest as fut_latest, fetch as fut_fetch
 from utils.db import get_col
 
-# ── 常量 ────────────────────────────────────────────────
-URL  = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-HEAD = {"User-Agent": "Mozilla/5.0 (fut-contracts-crawler/3.3.6)"}
+logging.basicConfig(level=logging.INFO)
+app = Flask(__name__)
 
-TARGETS = {
-    "小型臺指期貨": "mtx", "小型台指期貨": "mtx",
-    "微型臺指期貨": "imtx","微型台指期貨": "imtx",
-}
-ROLE_MAP = {
-    "自營商": "prop_net", "自營商(避險)": "prop_net",
-    "投信": "itf_net",
-    "外資": "foreign_net", "外資及陸資": "foreign_net",
-}
+line_api = LineBotApi(os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
+handler  = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
+ADMIN_IDS = set(filter(None, os.getenv("ADMIN_USER_IDS", "").split(",")))  # 逗號分隔 user_id
 
-DATE_RE = re.compile(r"日期\s*(\d{4}/\d{1,2}/\d{1,2})")
-NUM_RE  = re.compile(r"^-?\d[\d,]*$")
+# ── Helper ────────────────────────────────────────────
+def safe_latest(prod):
+    doc = fut_latest(prod, 1)
+    return f"{doc[0]['retail_net']:+,}" if doc else "N/A"
 
-# ── Mongo ──────────────────────────────────────────────
-COL = get_col("fut_contracts")
-
-def _field_from_keyitem(item):
-    """item 可為 tuple/list/dict，統一取欄位名"""
-    if isinstance(item, (list, tuple)):
-        return item[0]
-    if isinstance(item, dict):
-        # PyMongo 4.x: {'date': 1}
-        return next(iter(item))
-    return str(item)
-
-def ensure_index(col):
-    """刪除任何 *僅含 date* 的索引 -> 建複合唯一 (date,product)"""
-    for name, spec in list(col.index_information().items()):
-        if name == "_id_":
-            continue
-        fields = {_field_from_keyitem(k) for k in spec["key"]}
-        if fields == {"date"}:
-            col.drop_index(name)
-
-    if "date_1_product_1" not in col.index_information():
-        col.create_index(
-            [("date", ASCENDING), ("product", ASCENDING)],
-            unique=True,
-            name="date_1_product_1",
-        )
-
-ensure_index(COL)
-
-# ── 工具 ────────────────────────────────────────────────
-def today_tw():
-    return datetime.now(timezone(timedelta(hours=8))).date()
-
-def _extract_net(nums):
-    numeric = [n.replace(",", "") for n in nums if NUM_RE.match(n)]
-    return int(numeric[-2]) if len(numeric) >= 2 else None
-
-# ── 解析 ────────────────────────────────────────────────
-def parse(html: str):
-    soup = bs.BeautifulSoup(html, "lxml")
-    span = soup.find(string=DATE_RE)
-    if not span:
-        raise ValueError("找不到日期")
-    date_dt = datetime.strptime(DATE_RE.search(span).group(1), "%Y/%m/%d").replace(
-        tzinfo=timezone.utc
+def build_report():
+    pc = pc_latest(1)[0]
+    date = pc["date"].astimezone().strftime("%Y/%m/%d (%a)")
+    return (
+        f"日期：{date}\n"
+        f"🧮 PC ratio 未平倉比：{pc['pc_oi_ratio']:.2f}\n\n"
+        f"💼 散戶未平倉（口數）\n"
+        f"小台：{safe_latest('mtx')}\n"
+        f"微台：{safe_latest('imtx')}"
     )
 
-    results = {v: {"date": date_dt, "product": v} for v in TARGETS.values()}
-    current_prod = None
+# ── Routes ────────────────────────────────────────────
+@app.route("/callback", methods=["POST"])
+def callback():
+    body = request.get_data(as_text=True)
+    signature = request.headers.get("X-Line-Signature", "")
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400, "Bad signature")
+    return "OK"
 
-    for tr in soup.select("tbody tr"):
-        raw   = [td.get_text(strip=True) for td in tr.find_all("td")]
-        cells = [c.replace(",", "").replace("口", "") for c in raw]
-        if not cells:
-            continue
+# ── Event Handler ────────────────────────────────────
+@handler.add(MessageEvent, message=TextMessage)
+def on_message(event: MessageEvent):
+    uid  = event.source.user_id
+    text = event.message.text.strip().lower()
+    logging.info(f"[LINE] {uid} -> {text}")
 
-        for zh, code in TARGETS.items():
-            if zh in cells:
-                current_prod = code; break
-        if current_prod is None:
-            continue
+    # 公開指令
+    if text == "/today":
+        line_api.reply_message(event.reply_token, TextSendMessage(build_report()))
+        return
 
-        if len(cells) >= 3 and cells[1] in TARGETS and cells[2] in ROLE_MAP:
-            role, nums = cells[2], cells[3:]
-        elif cells[0] in ROLE_MAP:
-            role, nums = cells[0], cells[1:]
-        else:
-            continue
+    # 管理員指令
+    if uid not in ADMIN_IDS:
+        line_api.reply_message(event.reply_token, TextSendMessage("指令：/today"))
+        return
 
-        net = _extract_net(nums)
-        if net is not None:
-            results[current_prod][ROLE_MAP[role]] = net
+    if text == "/reset_fut":
+        col = get_col("fut_contracts")
+        col.drop()
+        fut_fetch()
+        line_api.reply_message(event.reply_token, TextSendMessage("fut_contracts 已重建 ✔"))
+        return
 
-    docs = []
-    for d in results.values():
-        if all(k in d for k in ("prop_net", "itf_net", "foreign_net")):
-            d["retail_net"] = -(d["prop_net"] + d["itf_net"] + d["foreign_net"])
-            docs.append(d)
-    return docs
+    if text == "/show_indexes":
+        idx_json = json.dumps(get_col("fut_contracts").index_information(), ensure_ascii=False, indent=2)
+        line_api.reply_message(event.reply_token, TextSendMessage(idx_json))
+        return
 
-# ── 抓取 ────────────────────────────────────────────────
-def fetch(upsert=True):
-    res = requests.get(URL, headers=HEAD, timeout=30)
-    res.encoding = res.apparent_encoding or "utf-8"
-    docs = parse(res.text)
+    line_api.reply_message(event.reply_token, TextSendMessage("管理指令：/reset_fut /show_indexes /today"))
 
-    if not docs:
-        print("[WARN] HTML 缺 MTX/IMTX 完整資料，Neutral Exit"); sys.exit(75)
-    if docs[0]["date"].date() < today_tw():
-        print("尚未更新，Neutral Exit"); sys.exit(75)
-
-    if upsert:
-        ops = [
-            UpdateOne(
-                {"date": d["date"].replace(tzinfo=None), "product": d["product"]},
-                {"$set": {**d, "date": d["date"].replace(tzinfo=None)}},
-                upsert=True,
-            ) for d in docs
-        ]
-        COL.bulk_write(ops, ordered=False)
-    print(f"更新 {len(docs)} 商品 fut_contracts → MongoDB")
-    return docs
-
-# ── 查詢 ────────────────────────────────────────────────
-def latest(product="mtx", days=1):
-    return list(
-        COL.find({"product": product}, {"_id": 0})
-           .sort("date", -1)
-           .limit(days)
-    )
-
-# ── CLI ────────────────────────────────────────────────
+# ── Local ─────────────────────────────────────────────
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if cmd == "run":
-        fetch()
-    elif cmd == "show":
-        prod = sys.argv[2] if len(sys.argv) > 2 else "mtx"
-        print(latest(prod, 3))
+    app.run(port=8000, debug=True)
