@@ -1,21 +1,20 @@
 """
-crawler/fut_contracts.py  v3.3.4
+crawler/fut_contracts.py  v3.3.5
 --------------------------------
 抓取 https://www.taifex.com.tw/cht/3/futContractsDateExcel
 同步寫入 2 商品：小型臺指期貨 (mtx)、微型臺指期貨 (imtx)
 
-★ 重點
-1. 逐 <tr> 掃描，鎖定「倒數第 2 個數字欄」= 未平倉多空淨額 (口數)
+★ 特點
+1. 逐 <tr> 掃描，鎖定「倒數第 2 個數字欄」＝未平倉多空淨額(口數)
 2. ROLE_MAP / TARGETS 全半形與變體容錯
-3. 自動遷移索引：刪除任何「僅含 date 欄位」索引 → 建 (date, product) 複合唯一索引
+3. 自動遷移索引：刪除所有「僅含 date 欄位」索引(無論名稱、複本) → 建 (date, product) 複合唯一索引
 4. 抓不到三法人齊全 ⇒ neutral exit，不 raise
 
 依賴：beautifulsoup4、lxml、pymongo
 """
 
 from __future__ import annotations
-import re
-import sys
+import re, sys
 from datetime import datetime, timezone, timedelta
 
 import bs4 as bs
@@ -24,8 +23,8 @@ from pymongo import ASCENDING, UpdateOne
 from utils.db import get_col
 
 # ── 常量設定 ──────────────────────────────────────────────
-URL  = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-HEAD = {"User-Agent": "Mozilla/5.0 (fut-contracts-crawler/3.3.4)"}
+URL   = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+HEAD  = {"User-Agent": "Mozilla/5.0 (fut-contracts-crawler/3.3.5)"}
 
 TARGETS = {
     "小型臺指期貨": "mtx",
@@ -42,24 +41,24 @@ ROLE_MAP = {
 }
 
 DATE_RE = re.compile(r"日期\s*(\d{4}/\d{1,2}/\d{1,2})")
-NUM_RE  = re.compile(r"^-?\d[\d,]*$")   # 任意千分位整數
+NUM_RE  = re.compile(r"^-?\d[\d,]*$")     # 任意千分位整數
 
 # ── Mongo 連線 & 索引保證 ────────────────────────────────
 COL = get_col("fut_contracts")
 
 def ensure_index(col):
     """
-    • 刪除任何『僅含 date 欄位』索引 (名稱 / unique 與否皆刪)
-    • 建立 (date, product) 複合唯一索引
+    1. 刪除任何『僅含 date 欄位』索引 (名稱/unique 與否、複本都刪)
+    2. 建立 (date, product) 複合唯一索引
     """
-    for name, spec in col.index_information().items():
+    for name, spec in list(col.index_information().items()):
         if name == "_id_":
             continue
-        keys = spec["key"]                # list[tuple] 或 list[list]
-        if len(keys) == 1:
-            field = keys[0][0] if isinstance(keys[0], (list, tuple)) else list(keys[0].values())[0]
-            if field == "date":
-                col.drop_index(name)
+        # spec["key"] 可能是 list[tuple] (3.x) 或 list[list] (4.x)
+        fields = {item[0] if isinstance(item, (list, tuple)) else list(item.keys())[0]
+                  for item in spec["key"]}
+        if fields == {"date"}:
+            col.drop_index(name)
 
     if "date_1_product_1" not in col.index_information():
         col.create_index(
@@ -75,7 +74,7 @@ def today_tw():
     return datetime.now(timezone(timedelta(hours=8))).date()
 
 def _extract_net(nums: list[str]) -> int | None:
-    """倒數第 2 個數字欄 (口數)；最後 1 個為契約金額。"""
+    """倒數第 2 個數字欄 (口數)，最後 1 個為契約金額。"""
     numeric = [n.replace(",", "") for n in nums if NUM_RE.match(n)]
     if len(numeric) < 2:
         return None
