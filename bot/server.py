@@ -1,58 +1,185 @@
 """
-bot/server.py  v2.1
--------------------
-Flask webhook server for LINE Bot
+crawler/fut_contracts.py  v3.3.1
+--------------------------------
+抓取 https://www.taifex.com.tw/cht/3/futContractsDateExcel
+輸出 2 商品：小型臺指期貨(mtx)、微型臺指期貨(imtx)
 
-指令
-  /today  → 今日 PC ratio 、散戶小台／微台未平倉
+‣ 重點
+   1. 逐 <tr> 掃描 → 鎖定倒數第 2 個數字欄 =「未平倉多空淨額‧口數」
+   2. ROLE_MAP / TARGETS 容錯：外資及陸資、全/半形皆可
+   3. 自動確保複合唯一索引 (date, product)；若偵測到舊 date_1 唯一索引即自動遷移
+   4. 抓不到完整三法人 ⇒ neutral exit，不 raise
+
+依賴：beautifulsoup4、lxml、pymongo
 """
 
-import os
-from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from __future__ import annotations
 
-from crawler.pc_ratio import latest as pc_latest
-from crawler.fut_contracts import latest as fut_latest
+import re
+import sys
+from datetime import datetime, timezone, timedelta
 
-SECRET = os.getenv("LINE_CHANNEL_SECRET")
-TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-line_api = LineBotApi(TOKEN)
-handler  = WebhookHandler(SECRET)
-app      = Flask(__name__)
+import bs4 as bs
+import requests
+from pymongo import ASCENDING, UpdateOne
+from utils.db import get_col
 
-@app.route("/callback", methods=["POST"])
-def callback():
-    body = request.get_data(as_text=True)
-    signature = request.headers.get("X-Line-Signature", "")
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400, "Bad signature")
-    return "OK"
+# ── 常量設定 ──────────────────────────────────────────────
+URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+HEAD = {"User-Agent": "Mozilla/5.0 (fut-contracts-crawler/3.3.1)"}
 
-def safe_latest(prod):
-    doc = fut_latest(prod, 1)
-    return f"{doc[0]['retail_net']:+,}" if doc else "N/A"
+TARGETS = {
+    "小型臺指期貨": "mtx",
+    "小型台指期貨": "mtx",
+    "微型臺指期貨": "imtx",
+    "微型台指期貨": "imtx",
+}
+ROLE_MAP = {
+    "自營商": "prop_net",
+    "自營商(避險)": "prop_net",
+    "投信": "itf_net",
+    "外資": "foreign_net",
+    "外資及陸資": "foreign_net",
+}
 
-def build_report():
-    pc   = pc_latest(1)[0]
-    date = pc["date"].astimezone().strftime("%Y/%m/%d (%a)")
-    return (
-        f"日期：{date}\n"
-        f"🧮 PC ratio 未平倉比：{pc['pc_oi_ratio']:.2f}\n\n"
-        f"💼 散戶未平倉（口數）\n"
-        f"小台：{safe_latest('mtx')}\n"
-        f"微台：{safe_latest('imtx')}"
+DATE_RE = re.compile(r"日期\s*(\d{4}/\d{1,2}/\d{1,2})")
+NUM_RE = re.compile(r"^-?\d[\d,]*$")  # 任意千分位整數
+
+# ── Mongo 連線 & 索引保證 ────────────────────────────────
+COL = get_col("fut_contracts")
+
+
+def ensure_index(col):
+    """確保 (date, product) 唯一索引存在；若舊 date_1 唯一索引仍在則自動遷移"""
+    idx = col.index_information()
+
+    # 移除舊單欄位唯一索引
+    if "date_1" in idx and idx["date_1"].get("unique"):
+        col.drop_index("date_1")
+
+    # 建立複合唯一索引
+    if "date_1_product_1" not in idx:
+        col.create_index(
+            [("date", ASCENDING), ("product", ASCENDING)],
+            unique=True,
+            name="date_1_product_1",
+        )
+
+
+ensure_index(COL)
+
+# ── 工具函式 ──────────────────────────────────────────────
+def today_tw():
+    return datetime.now(timezone(timedelta(hours=8))).date()
+
+
+def _extract_net(nums: list[str]) -> int | None:
+    """倒數第 2 個數字欄 (口數)；最後一欄為契約金額"""
+    numeric = [n.replace(",", "") for n in nums if NUM_RE.match(n)]
+    if len(numeric) < 2:
+        return None
+    return int(numeric[-2])
+
+
+# ── 解析 HTML ────────────────────────────────────────────
+def parse(html: str) -> list[dict]:
+    soup = bs.BeautifulSoup(html, "lxml")
+
+    # ① 解析日期
+    span = soup.find(string=DATE_RE)
+    if not span:
+        raise ValueError("找不到日期")
+    date_dt = datetime.strptime(DATE_RE.search(span).group(1), "%Y/%m/%d").replace(
+        tzinfo=timezone.utc
     )
 
-@handler.add(MessageEvent, message=TextMessage)
-def on_message(event):
-    if event.message.text.strip().lower() == "/today":
-        line_api.reply_message(event.reply_token, TextSendMessage(build_report()))
-    else:
-        line_api.reply_message(event.reply_token, TextSendMessage("指令：/today"))
+    # ② 初始化結果容器
+    results: dict[str, dict] = {
+        v: {"date": date_dt, "product": v} for v in TARGETS.values()
+    }
+    current_prod: str | None = None
 
+    # ③ 逐 <tr> 掃描
+    for tr in soup.select("tbody tr"):
+        raw = [td.get_text(strip=True) for td in tr.find_all("td")]
+        cells = [c.replace(",", "").replace("口", "") for c in raw]
+        if not cells:
+            continue
+
+        # 更新商品名稱
+        for zh, code in TARGETS.items():
+            if zh in cells:
+                current_prod = code
+                break
+        if current_prod is None:
+            continue
+
+        # 定位身份別
+        role = None
+        if len(cells) >= 3 and cells[1] in TARGETS and cells[2] in ROLE_MAP:
+            role = cells[2]
+            nums = cells[3:]
+        elif cells[0] in ROLE_MAP:
+            role = cells[0]
+            nums = cells[1:]
+        if role not in ROLE_MAP:
+            continue
+
+        net_val = _extract_net(nums)
+        if net_val is None:
+            continue
+
+        results[current_prod][ROLE_MAP[role]] = net_val
+
+    # ④ 彙整
+    docs = []
+    for d in results.values():
+        if all(k in d for k in ("prop_net", "itf_net", "foreign_net")):
+            d["retail_net"] = -(d["prop_net"] + d["itf_net"] + d["foreign_net"])
+            docs.append(d)
+    return docs
+
+
+# ── 抓取 & 寫入 ───────────────────────────────────────────
+def fetch(upsert: bool = True):
+    res = requests.get(URL, headers=HEAD, timeout=30)
+    res.encoding = res.apparent_encoding or "utf-8"
+    docs = parse(res.text)
+
+    if not docs:
+        print("[WARN] HTML 缺 MTX/IMTX 完整資料，Neutral Exit")
+        sys.exit(75)
+    if docs[0]["date"].date() < today_tw():
+        print("尚未更新，Neutral Exit")
+        sys.exit(75)
+
+    if upsert:
+        ops = [
+            UpdateOne(
+                {"date": d["date"].replace(tzinfo=None), "product": d["product"]},
+                {"$set": {**d, "date": d["date"].replace(tzinfo=None)}},
+                upsert=True,
+            )
+            for d in docs
+        ]
+        COL.bulk_write(ops, ordered=False)
+    print(f"更新 {len(docs)} 商品 fut_contracts → MongoDB")
+    return docs
+
+
+def latest(product="mtx", days: int = 1):
+    return list(
+        COL.find({"product": product}, {"_id": 0})
+        .sort("date", -1)
+        .limit(days)
+    )
+
+
+# ── CLI ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(port=8000, debug=True)
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "run":
+        fetch()
+    elif cmd == "show":
+        prod = sys.argv[2] if len(sys.argv) > 2 else "mtx"
+        print(latest(prod, 3))
