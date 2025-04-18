@@ -1,0 +1,28 @@
+name: crawl-taifex-seed
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: '回填起始日 (YYYY-MM-DD)'
+        required: true
+      end:
+        description: '回填結束日 (YYYY-MM-DD, 空 = 今日)'
+        required: false
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Seed PC Ratio & MTX
+        run: |
+          python crawler/pc_ratio.py run
+          python crawler/fut_contracts.py run
