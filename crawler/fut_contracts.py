@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TAIFEX ‑ 三大法人各期貨契約
-抓小型臺指(mtx)、微型臺指(imtx) ― 未平倉多空淨額(口數)
+抓小型臺指(mtx)、微型臺指(imtx) — 未平倉多空淨額(口數)
 """
 
 import datetime as dt
@@ -47,20 +47,24 @@ def parse(html: str) -> List[Dict]:
     docs: List[Dict] = []
 
     i = 0
-    while i < len(rows):
+    while i + 2 < len(rows):
         r_prop, r_itf, r_for = rows[i : i + 3]
 
-        tds_prop = r_prop.find_all("td")
-        if len(tds_prop) < 14:        # 分隔列或格式異常 → 跳過
+        tds_prop    = r_prop.find_all("td")
+        tds_itf     = r_itf.find_all("td")
+        tds_foreign = r_for.find_all("td")
+
+        # 三列都必須 >=14 格才是完整資料
+        if not (len(tds_prop) >= 14 and len(tds_itf) >= 14 and len(tds_foreign) >= 14):
             i += 1
             continue
 
         prod_name = tds_prop[1].get_text(strip=True)
-        prod = MAP_PROD.get(prod_name)
+        prod      = MAP_PROD.get(prod_name)
         if prod:
             prop_net    = _row_net(tds_prop)
-            itf_net     = _row_net(r_itf.find_all("td"))
-            foreign_net = _row_net(r_for.find_all("td"))
+            itf_net     = _row_net(tds_itf)
+            foreign_net = _row_net(tds_foreign)
             retail_net  = -(prop_net + itf_net + foreign_net)
 
             docs.append(
@@ -73,7 +77,7 @@ def parse(html: str) -> List[Dict]:
                     "retail_net": retail_net,
                 }
             )
-        i += 3
+        i += 3            # 移到下一組
     return docs
 
 
@@ -98,10 +102,10 @@ def fetch() -> List[Dict]:
     return docs
 
 
-def latest(prod: str = None) -> Dict | List[Dict]:
+def latest(prod: str | None = None) -> Dict | List[Dict]:
     if prod:
         return COL.find_one({"product": prod}, {"_id": 0}, sort=[("date", -1)])
-    return list(COL.find({}, {"_id": 0}).sort("date", -1).limit(10))
+    return list(COL.find({}, {"_id": 0}).sort("date", -1))
 
 
 if __name__ == "__main__":
