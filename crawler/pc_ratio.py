@@ -29,8 +29,8 @@ def _parse(text: str) -> pd.DataFrame:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     # 定位第一行資料（以 YYYY/ 開頭）
     start = next(i for i, l in enumerate(lines) if re.match(r"^20\d{2}/", l))
-    data = "
-".join(lines[start:])
+        data = "
+".join(lines[start:])lines[start:])
 
     # 判斷分隔符號
     sample = lines[start]
