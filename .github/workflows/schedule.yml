@@ -29,6 +29,6 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
       - run: pip install -r requirements.txt
       - name: 抓 PC Ratio
-        run: python crawler/pc_ratio.py run
+        run: python -m crawler.pc_ratio run
       - name: 抓 MTX 三大法人
-        run: python crawler/fut_contracts.py run
+        run: python -m crawler.fut_contracts run
