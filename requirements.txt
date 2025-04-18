@@ -1,0 +1,5 @@
+pandas
+requests
+pymongo[srv]
+python-dotenv
+line-bot-sdk
