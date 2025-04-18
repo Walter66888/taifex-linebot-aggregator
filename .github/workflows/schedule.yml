@@ -1,0 +1,34 @@
+name: crawl-taifex-schedule
+
+on:
+  # 台灣 15:05 ~ 16:20，每 15 分重試
+  schedule:
+    - cron: '5 7 * * 1-5'
+    - cron: '20 7 * * 1-5'
+    - cron: '35 7 * * 1-5'
+    - cron: '50 7 * * 1-5'
+    - cron: '5 8 * * 1-5'
+    - cron: '20 8 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - run: pip install -r requirements.txt
+      - name: 抓 PC Ratio
+        run: python crawler/pc_ratio.py run
+      - name: 抓 MTX 三大法人
+        run: python crawler/fut_contracts.py run
