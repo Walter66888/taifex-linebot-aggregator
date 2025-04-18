@@ -24,12 +24,30 @@ EXPECTED_COLS = [
 ]
 
 def _parse(text: str) -> pd.DataFrame:
+    """同時支援空白或逗號分隔格式。"""
+    import re, io, pandas as pd
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # 定位第一行資料（以 YYYY/ 開頭）
+    start = next(i for i, l in enumerate(lines) if re.match(r"^20\d{2}/", l))
+    data = "
+".join(lines[start:])
+
+    # 判斷分隔符號
+    sample = lines[start]
+    if "," in sample:
+        sep = ","
+    else:
+        sep = r"\s+"
+
     df = pd.read_csv(
-        io.StringIO("\n".join(text.splitlines()[2:])),
-        sep=r"\s+",
+        io.StringIO(data),
+        sep=sep,
         engine="python",
+        header=None,
         thousands=",",
     )
+    if df.shape[1] != 7:
+        raise ValueError(f"Unexpected columns: {df.shape[1]}")
     df.columns = EXPECTED_COLS
     df["date"] = pd.to_datetime(df["date"], format="%Y/%m/%d", utc=True)
     df[df.columns[1:]] = df[df.columns[1:]].apply(pd.to_numeric, downcast="integer")
