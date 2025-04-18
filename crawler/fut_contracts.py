@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-fut_contracts.py  v4.1   – final fix
-────────────────────────────────────
-• 解析任何列長；自動判斷 numeric 起點
-• 未平倉淨額(口數) = numeric[10]
+fut_contracts.py  v4.2
+----------------------
+• 每列取 12 個純數字；淨口數永遠是 nums[-2]（倒數第 2 欄）
+  → 投信、外資列少了 <td> 仍可正確定位
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import pymongo
 from utils.db import get_col
 
 URL  = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-HEAD = {"User-Agent": "taifex-fut-crawler/4.1"}
+HEAD = {"User-Agent": "taifex-fut-crawler/4.2"}
 
 TARGETS = {"小型臺指期貨":"mtx","小型台指期貨":"mtx",
            "微型臺指期貨":"imtx","微型台指期貨":"imtx"}
@@ -31,9 +31,7 @@ COL.create_index([("date",1),("product",1)], unique=True)
 def today_tw(): return datetime.now(timezone(timedelta(hours=8))).date()
 
 def _date(html:str)->datetime:
-    m=DATE_RE.search(html)
-    if not m: raise ValueError("日期抓取失敗")
-    return datetime.strptime(m.group(1),"%Y/%m/%d")
+    return datetime.strptime(DATE_RE.search(html).group(1),"%Y/%m/%d")
 
 def parse(html:str):
     soup=BeautifulSoup(html,"lxml")
@@ -46,24 +44,20 @@ def parse(html:str):
         tds=[td.get_text(strip=True) for td in tr.find_all("td")]
         if not tds: continue
 
-        # ── 商品名稱 & num_start 判定 ──
         if len(tds)>1 and tds[1] in TARGETS:
             cur = TARGETS[tds[1]]
-            identity_idx=2
-            num_start=3
+            identity_idx=2; num_start=3
         else:
-            identity_idx=0
-            num_start=1
+            identity_idx=0; num_start=1
         if cur is None or identity_idx>=len(tds): continue
 
-        role_name=tds[identity_idx]
-        role_key=ROLE_MAP.get(role_name)
+        role = tds[identity_idx]
+        role_key = ROLE_MAP.get(role)
         if role_key is None: continue
 
-        nums=[NUM(x) for x in tds[num_start:]]
-        if len(nums) < 11: continue   # 保險
-
-        net = nums[10]               # 未平倉淨額 口數
+        nums=[NUM(x) for x in tds[num_start:] if x]   # 取後續全部數字
+        if len(nums)<2: continue
+        net = nums[-2]                                # 倒數第 2 = 未平倉淨額 口數
         res[cur][role_key]=net
 
     return [{**d,"retail_net":-(d["prop_net"]+d["itf_net"]+d["foreign_net"])} for d in res.values()]
