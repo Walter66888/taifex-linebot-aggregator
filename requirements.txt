@@ -3,3 +3,5 @@ requests
 pymongo[srv]
 python-dotenv
 line-bot-sdk
+lxml
+beautifulsoup4
