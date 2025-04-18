@@ -5,3 +5,4 @@ python-dotenv
 line-bot-sdk
 lxml
 beautifulsoup4==4.12.*
+gunicorn
