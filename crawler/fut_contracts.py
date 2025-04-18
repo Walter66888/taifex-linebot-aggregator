@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-抓取 TAIFEX 三大法人未平倉餘額（分契約）
-小型臺指(mtx) 與 微型臺指(imtx) 兩商品
-
-表格版型固定，未平倉區的『多空淨額‑口數』欄位
-在每列 <td> 的索引固定為 13  (0 起算)
-   ┌────────────────────────────┐
-seq│prod│id │ …  trade(6) … │ … OI(6) … │
- 0    1    2           ↑               ↑
-            3~8   →   6 7   9 10 11 **13**
+TAIFEX ‑ 三大法人各期貨契約
+抓小型臺指(mtx)、微型臺指(imtx) ‑『未平倉多空淨額‧口數』
 """
 
 import datetime as dt
@@ -18,105 +11,96 @@ from typing import List, Dict
 
 import bs4
 import requests
+from pymongo import UpdateOne
 
-from utils.db import get_col
+from utils.db import get_col          # 你的 DB 封裝
 
 URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-COL = get_col("fut_contracts")          # 已在 utils.db.ensure_index(date,product) 建唯一索引
+COL = get_col("fut_contracts")
+COL.create_index([("date", 1), ("product", 1)], unique=True)
 
-# ────────────────────────────── 共用小工具 ──────────────────────────────
-def _clean_int(txt: str) -> int:
-    """移除逗號、空白轉 int"""
-    return int(re.sub(r"[,\s]", "", txt))
+MAP_PROD = {"小型臺指期貨": "mtx", "微型臺指期貨": "imtx"}
+LOGGER = logging.getLogger(__name__)
 
-def _parse_date(soup: bs4.BeautifulSoup) -> dt.date:
-    """
-    解析<h2> 區段上的「日期YYYY/MM/DD」
-    """
-    span = soup.find("span", class_="right")
-    if not span or "日期" not in span.text:
-        raise RuntimeError("找不到日期欄位")
-    dstr = span.text.strip().replace("日期", "")
-    return dt.datetime.strptime(dstr, "%Y/%m/%d").date()
 
-def _one_row_net(td_list: List[bs4.Tag]) -> int:
-    """
-    表格中單列 <td> 清單 ⇒ 回傳 未平倉多空淨額(口數)
-    根據固定版型：index 13 就是『未平倉多空淨額 – 口數』
-    """
-    return _clean_int(td_list[13].text)
+def _clean_int(s: str) -> int:
+    return int(re.sub(r"[,\s]", "", s)) if s.strip() else 0
 
-# ────────────────────────────── 解析核心 ──────────────────────────────
-MAP_PROD = {
-    "小型臺指期貨": "mtx",
-    "微型臺指期貨": "imtx",
-}
+
+def _trade_date(soup: bs4.BeautifulSoup) -> dt.date:
+    m = re.search(r"日期\s*(\d{4})/(\d{2})/(\d{2})", soup.text)
+    if not m:
+        raise RuntimeError("找不到日期")
+    return dt.date(int(m[1]), int(m[2]), int(m[3]))
+
+
+def _row_net(tds: List[bs4.Tag]) -> int:
+    """第 14 格(index 13) = 未平倉多空淨額 ‧ 口數"""
+    return _clean_int(tds[13].get_text())
+
 
 def parse(html: str) -> List[Dict]:
     soup = bs4.BeautifulSoup(html, "lxml")
-    date = _parse_date(soup)
+    date = _trade_date(soup)
 
-    rows = soup.select("tbody tr.12bk")            # 每三列為同一商品
-    if not rows:
-        raise RuntimeError("找不到 <tr.12bk>，版型可能變動")
+    rows = soup.find_all("tr", class_="12bk")      # ← 不用 CSS selector
+    docs: List[Dict] = []
 
-    docs = []
-    for i in range(0, len(rows), 3):
-        r_prop, r_itf, r_foreign = rows[i : i + 3]
-        prod_name = r_prop.find_all("td")[1].get_text(strip=True)
+    i = 0
+    while i < len(rows):
+        # 每 3 列為 1 商品
+        r_prop, r_itf, r_for = rows[i : i + 3]
+        tds_prop = r_prop.find_all("td")
+        prod_name = tds_prop[1].get_text(strip=True)
+
         prod = MAP_PROD.get(prod_name)
-        if not prod:                               # 只抓 mtx / imtx
-            continue
+        if prod:                                   # 只處理 mtx/imtx
+            prop_net    = _row_net(tds_prop)
+            itf_net     = _row_net(r_itf.find_all("td"))
+            foreign_net = _row_net(r_for.find_all("td"))
+            retail_net  = -(prop_net + itf_net + foreign_net)
 
-        td_prop     = r_prop.find_all("td")
-        td_itf      = r_itf.find_all("td")
-        td_foreign  = r_foreign.find_all("td")
-
-        prop_net    = _one_row_net(td_prop)
-        itf_net     = _one_row_net(td_itf)
-        foreign_net = _one_row_net(td_foreign)
-        retail_net  = -(prop_net + itf_net + foreign_net)
-
-        docs.append(
-            {
-                "date":      dt.datetime.combine(date, dt.time()),
-                "product":   prod,
-                "prop_net":  prop_net,
-                "itf_net":   itf_net,
-                "foreign_net": foreign_net,
-                "retail_net":  retail_net,
-            }
-        )
+            docs.append(
+                {
+                    "date": dt.datetime.combine(date, dt.time()),
+                    "product": prod,
+                    "prop_net": prop_net,
+                    "itf_net": itf_net,
+                    "foreign_net": foreign_net,
+                    "retail_net": retail_net,
+                }
+            )
+        i += 3
     return docs
 
-# ────────────────────────────── 對外 API ──────────────────────────────
+
 def fetch() -> List[Dict]:
-    """抓網頁 → 解析 → upsert 到 MongoDB，並回傳文件"""
     res = requests.get(URL, timeout=20)
     res.encoding = "utf-8"
-
     docs = parse(res.text)
 
-    ops = [
-        bs4.dammit.UpdateOne(
-            {"date": d["date"], "product": d["product"]},
-            {"$set": d},
-            upsert=True,
+    if docs:
+        COL.bulk_write(
+            [
+                UpdateOne(
+                    {"date": d["date"], "product": d["product"]},
+                    {"$set": d},
+                    upsert=True,
+                )
+                for d in docs
+            ],
+            ordered=False,
         )
-        for d in docs
-    ]
-    if ops:
-        COL.bulk_write(ops, ordered=False)
-
+    LOGGER.info("upsert %d docs", len(docs))
     return docs
 
-def latest(prod: str = None) -> Dict:
-    """取最新(同一天)的單筆或全體"""
-    qry = {"product": prod} if prod else {}
-    mm = list(COL.find(qry).sort("date", -1).limit(2))
-    return mm[0] if mm else {}
 
-# ────────────────────────────── debug ──────────────────────────────
+def latest(prod: str = None) -> Dict | List[Dict]:
+    if prod:
+        return COL.find_one({"product": prod}, {"_id": 0}, sort=[("date", -1)])
+    return list(COL.find({}, {"_id": 0}).sort("date", -1).limit(10))
+
+
 if __name__ == "__main__":
     from pprint import pprint
     pprint(fetch())
