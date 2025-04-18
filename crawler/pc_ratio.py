@@ -1,5 +1,5 @@
 """
-crawler/pc_ratio.py  v1.5
+crawler/pc_ratio.py  v1.6
 -------------------------
 抓取 https://www.taifex.com.tw/cht/3/pcRatioExcel
 自動偵測 HTML / CSV，寫入 MongoDB《pc_ratio》集合
@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from utils.db import get_col
 
 URL  = "https://www.taifex.com.tw/cht/3/pcRatioExcel"
-HEAD = {"User-Agent": "Mozilla/5.0 (pc-ratio-crawler/1.5)"}
+HEAD = {"User-Agent": "Mozilla/5.0 (pc-ratio-crawler/1.6)"}
 COL  = get_col("pc_ratio")
 
 EXPECTED = [
@@ -21,11 +21,9 @@ EXPECTED = [
 ]
 DATE_RE = re.compile(r"^20\d{2}/\d{1,2}/\d{1,2}$")
 
-# ───────────────────────── CSV 解析 ──────────────────────────
 def _parse_csv(text: str) -> pd.DataFrame:
     text  = text.lstrip("\ufeff")
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-
     try:
         idx = next(i for i, l in enumerate(lines)
                    if DATE_RE.match(l.split(",")[0].split()[0]))
@@ -42,11 +40,8 @@ def _parse_csv(text: str) -> pd.DataFrame:
     df.columns = EXPECTED
     return df
 
-# ───────────────────────── HTML 解析 ─────────────────────────
 def _parse_html(html: str) -> pd.DataFrame:
-    # pandas ≥ 2.2 需將 literal HTML 包成 StringIO
     tbls = pd.read_html(io.StringIO(html), thousands=",")
-
     for t in tbls:
         first = str(t.iloc[0, 0]).strip()
         if DATE_RE.match(first):
@@ -60,10 +55,8 @@ def _parse_html(html: str) -> pd.DataFrame:
             continue
         df.columns = EXPECTED
         return df
-
     raise ValueError("HTML 無符合格式的表格")
 
-# ──────────────────────── 自動判斷 ──────────────────────────
 def parse(raw: str) -> pd.DataFrame:
     probe = raw.lstrip()[:4096].lower()
     if probe.startswith("<") or "<table" in probe or "<html" in probe:
@@ -79,7 +72,6 @@ def parse(raw: str) -> pd.DataFrame:
 def today_tw() -> datetime.date:
     return datetime.now(timezone(timedelta(hours=8))).date()
 
-# ───────────────────────── 主流程 ───────────────────────────
 def fetch(upsert: bool = True) -> pd.DataFrame:
     res = requests.get(URL, headers=HEAD, timeout=30)
     res.encoding = res.apparent_encoding or "utf-8"
@@ -90,22 +82,25 @@ def fetch(upsert: bool = True) -> pd.DataFrame:
         sys.exit(75)
 
     if upsert:
-        COL.bulk_write(
-            [{
+        ops = []
+        for _, row in df.iterrows():
+            doc = row.to_dict()
+            # pandas.Timestamp 轉純 Python datetime，且移除 tzinfo 讓 PyMongo 視作 UTC
+            doc["date"] = row["date"].to_pydatetime().replace(tzinfo=None)
+            ops.append({
                 "updateOne": {
-                    "filter": {"date": row["date"]},
-                    "update": {"$set": row.to_dict()},
+                    "filter": {"date": doc["date"]},
+                    "update": {"$set": doc},
                     "upsert": True,
                 }
-            } for _, row in df.iterrows()],
-            ordered=False,
-        )
+            })
+        if ops:
+            COL.bulk_write(ops, ordered=False)
     return df
 
 def latest(days: int = 1):
     return list(COL.find({}, {"_id": 0}).sort("date", -1).limit(days))
 
-# ────────────────────────── CLI ────────────────────────────
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "run":
