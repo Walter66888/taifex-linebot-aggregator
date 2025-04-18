@@ -1,129 +1,145 @@
+# -*- coding: utf-8 -*-
 """
-crawler/fut_contracts.py  v3.9   – robust header‑safe version
-------------------------------------------------------------
-抓取 https://www.taifex.com.tw/cht/3/futContractsDateExcel
+fut_contracts.py  v3.6  2025‑04‑18
+----------------------------------
+抓「三大法人－區分各期貨契約」網頁，
+只萃取『小型臺指期貨‧微型臺指期貨』的
+　┌─ 自營商(prop)  投信(itf)  外資(foreign)
+　└─ 未平倉多空淨額(口數)  ➜ retail = ‑(prop+itf+foreign)
 
-核心改進
-• 先在 <thead> 找到「未平倉餘額」→ 同列「多空淨額」→ 再往右 2 格 = 淨額‧口數欄 index
-  ‑ 若任何版面變動找不到，就 fallback=10（舊版正確位置）
-• 只在 <td index 1> (商品名稱欄，rowspan=3) 比對 TARGETS → 絕不混行
-• retail_net = -(prop_net + itf_net + foreign_net)
+廉價但可靠的抓法：
+1. 每一個法人 row 固定含 15 個 <td>；第 3 欄起有 12 個純數字欄位
+   index 10 (=第 11 欄) 永遠是「未平倉多空淨額－口數」。
+   只要取它即可，不再去動態比對表頭文字，避免抓錯欄。
+2. 以『商品名稱』判斷產品、以『身份別』判斷法人，累加完一次就停。
+3. 建立 (date, product) 複合唯一索引 → 不會再撞 DuplicateKey。
+
+──────────────────────────────────────────
 """
-
 from __future__ import annotations
-import re, sys
-from datetime import datetime, timezone, timedelta
-import bs4 as bs, requests
-from pymongo import ASCENDING, UpdateOne
+
+import datetime as _dt
+import re
+import logging
+from typing import Dict, List
+
+import requests
+from bs4 import BeautifulSoup
+import pymongo                                    # type: ignore
+
 from utils.db import get_col
 
-# ── 常量 ────────────────────────────────────────────────
-URL  = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-HEAD = {"User-Agent": "taifex-fut-crawler/3.9"}
+_URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
 
-TARGETS = {
-    "小型臺指期貨": "mtx", "小型台指期貨": "mtx",
-    "微型臺指期貨": "imtx","微型台指期貨": "imtx",
+# ── Mongo ──────────────────────────────────────────────────────────
+COL = get_col("fut_contracts")
+# 只建立一次即可；若已存在 PyMongo 會吞掉 DuplicateKeyError
+COL.create_index([("date", 1), ("product", 1)], unique=True)
+
+# ── 表格->程式 轉換表 ────────────────────────────────────────────────
+IDENT_MAP = {"自營商": "prop", "投信": "itf", "外資": "foreign"}
+PRODUCT_CODE = {
+    "小型臺指期貨": "mtx",
+    "微型臺指期貨": "imtx",
 }
-ROLE_MAP = {
-    "自營商": "prop_net", "自營商(避險)": "prop_net",
-    "投信":   "itf_net",
-    "外資":   "foreign_net", "外資及陸資": "foreign_net",
-}
 
-DATE_RE = re.compile(r"日期\s*(\d{4}/\d{1,2}/\d{1,2})")
-NUM     = lambda s:int(s.replace(",","")) if s and s.replace(",","").lstrip("-").isdigit() else 0
-FALLBACK_IDX = 10         # 舊版表格：未平倉淨額‧口數在 tds[10]
+_NUM_RE = re.compile(r"[-\d,]+")
 
-COL = get_col("fut_contracts")   # utils/db.py 已建唯一複合索引
 
-# ── 時間工具 ───────────────────────────────────────────
-def today_tw(): return datetime.now(timezone(timedelta(hours=8))).date()
+def _int(txt: str) -> int:
+    """把 '8,551' → 8551 , '‑3,048' → -3048 , 其它 → 0"""
+    m = _NUM_RE.search(txt.strip().replace("—", "0"))
+    return int(m.group(0).replace(",", "")) if m else 0
 
-# ── 解析 thead 取得口數欄 index ─────────────────────────
-def _oi_net_idx(soup: bs.BeautifulSoup) -> int:
-    """回傳未平倉‧多空淨額‧口數所在 td index，找不到則給 fallback=10"""
-    for th in soup.select("thead th"):
-        txt = th.get_text(strip=True).replace("　", "").replace(" ", "")
-        if txt.startswith("未平倉餘額"):
-            row_ths = list(th.parent.find_all("th"))
-            for i, t in enumerate(row_ths):
-                if t.get_text(strip=True).replace("　", "").replace(" ", "") == "多空淨額":
-                    return (i * 2) + 2    # 因 colspan=2：long/amt, short/amt, 淨額/口數
-    return FALLBACK_IDX
 
-# ── 解析 HTML ──────────────────────────────────────────
-def parse(html: str):
-    soup = bs.BeautifulSoup(html, "lxml")
-    date_dt = datetime.strptime(
-        DATE_RE.search(soup.find(string=DATE_RE)).group(1), "%Y/%m/%d"
-    ).replace(tzinfo=timezone.utc)
-    idx_net = _oi_net_idx(soup)
+# ── 解析 html ──────────────────────────────────────────────────────
+def _date_from_html(html: str) -> _dt.datetime:
+    m = re.search(r"日期\s*(\d{4}/\d{2}/\d{2})", html)
+    if not m:
+        raise ValueError("抓不到日期")
+    return _dt.datetime.strptime(m.group(1), "%Y/%m/%d")
 
-    res = {v: {"date": date_dt, "product": v,
-               "prop_net": 0, "itf_net": 0, "foreign_net": 0}
-           for v in TARGETS.values()}
 
-    current_prod = None
-    for tr in soup.select("tbody tr"):
-        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if not tds:
+def parse(html: str) -> List[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    rows = soup.select("tbody tr.12bk")
+
+    prod_stats: Dict[str, Dict[str, int]] = {}   # {code: {prop, itf, foreign}}
+
+    for tr in rows:
+        tds = tr.find_all("td")
+        if len(tds) < 15:                # 保險：不是數字列就跳過
             continue
 
-        # ── 商品名稱只出現在 index 1 (rowspan=3) ──
-        if len(tds) > 1 and tds[1] in TARGETS:
-            current_prod = TARGETS[tds[1]]
-        if current_prod is None:
+        prod_name = tds[1].get_text(strip=True)
+        if prod_name not in PRODUCT_CODE:
             continue
 
-        # ── 身份別 ──
-        role = tds[2] if len(tds) >= 3 and tds[2] in ROLE_MAP else (
-               tds[0] if tds[0] in ROLE_MAP else None)
-        if role not in ROLE_MAP:
+        identity = tds[2].get_text(strip=True)
+        role = IDENT_MAP.get(identity)
+        if role is None:
             continue
 
-        if idx_net >= len(tds):
+        nums = [_int(td.get_text()) for td in tds[3:]]   # 12 個純數字欄
+        if len(nums) < 11:
             continue
-        res[current_prod][ROLE_MAP[role]] = NUM(tds[idx_net])
+        net_lots = nums[10]               # ← 位置固定
 
-    # ── 產出文件 ──
-    return [
-        {**d, "retail_net": -(d["prop_net"] + d["itf_net"] + d["foreign_net"])}
-        for d in res.values()
-    ]
+        code = PRODUCT_CODE[prod_name]
+        prod_stats.setdefault(code, {"prop": 0, "itf": 0, "foreign": 0})[role] = net_lots
 
-# ── 抓取 & 寫入 DB ──────────────────────────────────────
-def fetch(upsert: bool = True):
-    html = requests.get(URL, headers=HEAD, timeout=30).text
-    docs = parse(html)
+        # 若三法人都到齊了就可以提早結束迴圈，節省解析時間
+        if all(k in prod_stats[code] and isinstance(prod_stats[code][k], int)
+               for k in ("prop", "itf", "foreign")) and len(prod_stats) == len(PRODUCT_CODE):
+            pass  # 不 break，保險起見還是走完整個 tbody
 
-    if docs[0]["date"].date() < today_tw():
-        print("[WARN] fut_contracts 未更新"); sys.exit(75)
+    if not prod_stats:
+        raise RuntimeError("找不到任何目標商品資料")
 
-    if upsert:
-        ops = [
-            UpdateOne(
-                {"date": d["date"].replace(tzinfo=None), "product": d["product"]},
-                {"$set": {**d, "date": d["date"].replace(tzinfo=None)}},
-                upsert=True,
-            ) for d in docs
-        ]
-        COL.bulk_write(ops, ordered=False)
-    print(f"更新 {len(docs)} 商品 fut_contracts → MongoDB")
+    date = _date_from_html(html)
+    docs = []
+    for code, st in prod_stats.items():
+        retail = -(st["prop"] + st["itf"] + st["foreign"])
+        docs.append(
+            {
+                "date": date,
+                "product": code,
+                "prop_net": st["prop"],
+                "itf_net": st["itf"],
+                "foreign_net": st["foreign"],
+                "retail_net": retail,
+            }
+        )
     return docs
 
-# ── 查詢 API ──────────────────────────────────────────
-def latest(product: str = "mtx", days: int = 1):
-    return list(
-        COL.find({"product": product}, {"_id": 0})
-           .sort("date", -1)
-           .limit(days)
-    )
 
-# ── CLI ───────────────────────────────────────────────
+# ── 抓網頁 + 寫入 Mongo ─────────────────────────────────────────────
+def fetch() -> List[dict]:
+    logging.info("[fut_contracts] fetching taifex html…")
+    res = requests.get(_URL, timeout=15)
+    res.encoding = "utf-8"
+    docs = parse(res.text)
+
+    ops = [
+        pymongo.UpdateOne(
+            {"date": d["date"], "product": d["product"]},
+            {"$set": d},
+            upsert=True,
+        )
+        for d in docs
+    ]
+    if ops:
+        COL.bulk_write(ops, ordered=False)
+    logging.info("[fut_contracts] upsert %s docs", len(docs))
+    return docs
+
+
+# ── 查詢最近資料 (給 bot 用) ──────────────────────────────────────────
+def latest(product: str, limit: int = 1) -> List[dict]:
+    return list(COL.find({"product": product}).sort("date", -1).limit(limit))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "show":
-        prod = sys.argv[2] if len(sys.argv) > 2 else "mtx"
-        print(latest(prod, 3))
-    else:
-        fetch()
+    from pprint import pprint
+
+    pprint(fetch())
