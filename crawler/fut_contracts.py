@@ -1,113 +1,100 @@
 # -*- coding: utf-8 -*-
-"""
-TAIFEX ‑ 三大法人各期貨契約
-抓小型臺指(mtx)、微型臺指(imtx) — 未平倉多空淨額(口數)
-"""
-
-import datetime as dt
-import logging
-import re
+# ------------------------------------------------------------
+# crawler/fut_contracts.py  v3.9  2025-04-19 09:50  debug+
+# ------------------------------------------------------------
+import re, requests, io, os, logging
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict
-
-import bs4
-import requests
-from pymongo import UpdateOne
-
+from bs4 import BeautifulSoup
 from utils.db import get_col
+from pymongo import ASCENDING
 
-URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-COL = get_col("fut_contracts")
-COL.create_index([("date", 1), ("product", 1)], unique=True)
-
-MAP_PROD = {"小型臺指期貨": "mtx", "微型臺指期貨": "imtx"}
 LOGGER = logging.getLogger(__name__)
+URL    = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+COL   = get_col("fut_contracts")
+COL.create_index([("product",1), ("date",1)], unique=True)
 
-
+# ────────────────────── helper ──────────────────────────────
 def _clean_int(s: str) -> int:
-    return int(re.sub(r"[,\s]", "", s)) if s.strip() else 0
-
-
-def _trade_date(soup: bs4.BeautifulSoup) -> dt.date:
-    m = re.search(r"日期\s*(\d{4})/(\d{2})/(\d{2})", soup.text)
-    if not m:
-        raise RuntimeError("找不到日期")
-    return dt.date(int(m[1]), int(m[2]), int(m[3]))
-
-
-def _row_net(tds: List[bs4.Tag]) -> int:
-    """第 14 格(index 13) = 未平倉多空淨額 ‧ 口數"""
-    return _clean_int(tds[13].get_text())
-
+    return int(re.sub(r"[^\d\-]", "", s or "0") or 0)
 
 def parse(html: str) -> List[Dict]:
-    soup = bs4.BeautifulSoup(html, "lxml")
-    date = _trade_date(soup)
+    soup = BeautifulSoup(html, "lxml")
+    # 每個商品三條 <tr> ，第一列是自營商，以此定位
+    rows = soup.select("tbody > tr[class]")
+    if not rows:
+        LOGGER.error("⚠️  HTML rows 解析失敗，rows=0")
+        return []
 
-    rows = soup.find_all("tr", class_="12bk")
-    docs: List[Dict] = []
-
-    i = 0
-    while i + 2 < len(rows):
-        r_prop, r_itf, r_for = rows[i : i + 3]
-
-        tds_prop    = r_prop.find_all("td")
-        tds_itf     = r_itf.find_all("td")
-        tds_foreign = r_for.find_all("td")
-
-        # 三列都必須 >=14 格才是完整資料
-        if not (len(tds_prop) >= 14 and len(tds_itf) >= 14 and len(tds_foreign) >= 14):
-            i += 1
+    docs = []
+    for i in range(0, len(rows), 3):
+        try:
+            r_prop, r_itf, r_foreign = rows[i:i+3]
+        except ValueError:
+            LOGGER.warning("row grouping 不足三列，跳過 index=%s", i)
             continue
 
+        tds_prop = r_prop.find_all("td")
         prod_name = tds_prop[1].get_text(strip=True)
-        prod      = MAP_PROD.get(prod_name)
-        if prod:
-            prop_net    = _row_net(tds_prop)
-            itf_net     = _row_net(tds_itf)
-            foreign_net = _row_net(tds_foreign)
-            retail_net  = -(prop_net + itf_net + foreign_net)
 
-            docs.append(
-                {
-                    "date": dt.datetime.combine(date, dt.time()),
-                    "product": prod,
-                    "prop_net": prop_net,
-                    "itf_net": itf_net,
-                    "foreign_net": foreign_net,
-                    "retail_net": retail_net,
-                }
-            )
-        i += 3            # 移到下一組
+        # 只抓小台、微台
+        if prod_name not in ("小型臺指期貨", "微型臺指期貨"):
+            continue
+        product = "mtx" if prod_name.startswith("小型") else "imtx"
+
+        prop_net   = _clean_int(tds_prop[14].get_text())
+        itf_net    = _clean_int(r_itf.find_all("td")[14].get_text())
+        foreign_net= _clean_int(r_foreign.find_all("td")[14].get_text())
+        retail_net = -(prop_net + itf_net + foreign_net)
+
+        date_str = soup.select_one(".h2 + table span.right").get_text(strip=True) \
+                  .replace("日期","").strip()    # ex: 2025/04/18
+        date_obj = datetime.strptime(date_str, "%Y/%m/%d").replace(tzinfo=timezone.utc)
+
+        docs.append(dict(
+            date=date_obj,
+            product=product,
+            prop_net=prop_net,
+            itf_net=itf_net,
+            foreign_net=foreign_net,
+            retail_net=retail_net
+        ))
     return docs
-
 
 def fetch() -> List[Dict]:
-    res = requests.get(URL, timeout=20)
-    res.encoding = "utf-8"
+    LOGGER.info("fetch %s", URL)
+    res = requests.get(URL, headers=HEADERS, timeout=20)
+    res.raise_for_status()
     docs = parse(res.text)
+    if not docs:
+        raise RuntimeError("未解析到任何 fut_contracts 資料")
 
-    if docs:
-        COL.bulk_write(
-            [
-                UpdateOne(
-                    {"date": d["date"], "product": d["product"]},
-                    {"$set": d},
-                    upsert=True,
-                )
-                for d in docs
-            ],
-            ordered=False,
-        )
-    LOGGER.info("upsert %d docs", len(docs))
+    ops = [
+        dict(update_one=dict(
+            filter={"product": d["product"], "date": d["date"]},
+            update={"$set": d},
+            upsert=True))
+        for d in docs
+    ]
+    COL.bulk_write(ops, ordered=False)
+    LOGGER.info("upserted %d docs", len(docs))
     return docs
 
-
-def latest(prod: str | None = None) -> Dict | List[Dict]:
-    if prod:
-        return COL.find_one({"product": prod}, {"_id": 0}, sort=[("date", -1)])
-    return list(COL.find({}, {"_id": 0}).sort("date", -1))
-
+def latest(product: str = None):
+    q = {"product": product} if product else {}
+    return COL.find_one(q, {"_id":0}, sort=[("date",-1)])
 
 if __name__ == "__main__":
-    from pprint import pprint
-    pprint(fetch())
+    import argparse, pprint, sys
+    ap = argparse.ArgumentParser()
+    ap.add_argument("run", nargs="?", default="run")
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args()
+
+    if args.run == "run":
+        try:
+            pprint.pprint(fetch())
+        except Exception as e:
+            LOGGER.error("crawler error: %s", e)
+            sys.exit(1)
