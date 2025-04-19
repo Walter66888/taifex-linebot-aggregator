@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# crawler/fut_contracts.py  v5.1  2025‑04‑19
+# crawler/fut_contracts.py  v6.0  2025‑04‑19
 """
 抓取『三大法人‑區分各期貨契約』並存儲整個 HTML：
   ‑ 小型臺指期貨 (product = mtx)
@@ -23,9 +23,9 @@ from bs4 import BeautifulSoup
 from pymongo import ASCENDING, UpdateOne
 from utils.db import get_col
 
-LOG      = logging.getLogger(__name__)
-URL      = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
-HEADERS  = {"User-Agent": "Mozilla/5.0"}
+LOG = logging.getLogger(__name__)
+URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # 創建兩個集合：一個存原始 HTML，一個存解析後資料
 RAW_COL = get_col("fut_raw_html")
@@ -42,38 +42,24 @@ TARGETS = {
 # ───────────────────────── 內部輔助函數 ──────────────────────────
 def _clean_int(txt: str) -> int:
     """清理字串為整數，移除所有非數字和負號的字符"""
+    if not txt:
+        return 0
     txt = txt.strip() if txt else "0"
     # 僅保留數字和負號
     cleaned = re.sub(r"[^\d\-]", "", txt) or "0"
     return int(cleaned)
 
 
-def _extract_net_value(row, col_index: int) -> int:
-    """
-    從表格行中提取淨值
-    :param row: BeautifulSoup 的 tr 元素
-    :param col_index: 含有多空淨額的列索引
-    :return: 解析後的整數值
-    """
-    cells = row.find_all("td")
-    if len(cells) <= col_index:
-        LOG.debug(f"行中的儲存格數量不足，預期至少 {col_index+1} 個，實際有 {len(cells)} 個")
-        return 0
-    
-    # 從儲存格中提取包含數字的 font 標籤
-    font_tag = cells[col_index].find("font")
-    if not font_tag:
-        LOG.debug(f"在儲存格 {col_index} 中未找到 font 標籤")
-        return 0
-    
-    text = font_tag.get_text(strip=True)
-    LOG.debug(f"從 font 標籤提取的文本：{text}")
-    return _clean_int(text)
-
-
 # ────────────────────────── 核心解析函數 ─────────────────────────────
 def parse_html(html: str) -> tuple[datetime, list[dict]]:
-    """解析 HTML 內容，返回 (日期物件, 解析後文檔列表)"""
+    """
+    解析 HTML 內容，返回 (日期物件, 解析後文檔列表)
+    
+    特別處理 HTML 表格中的三大法人資料：
+    1. 找到小型臺指期貨和微型臺指期貨所在的位置
+    2. 針對每個產品，獲取自營商、投信和外資的未平倉淨額
+    3. 計算散戶淨額 = -(自營商淨額 + 投信淨額 + 外資淨額)
+    """
     soup = BeautifulSoup(html, "lxml")
 
     # 解析日期
@@ -82,92 +68,98 @@ def parse_html(html: str) -> tuple[datetime, list[dict]]:
         raise RuntimeError("找不到日期")
     date_obj = datetime.strptime(m.group(1), "%Y/%m/%d").replace(tzinfo=timezone.utc)
 
-    # 打印原始 HTML 的部分內容，用於調試
-    LOG.debug(f"HTML 前 200 字符: {html[:200]}")
+    # 找出所有包含商品名稱的表格單元格
+    product_cells = soup.find_all("td", class_="left_tit", attrs={"rowspan": "3"})
     
-    # 找出所有表格行
-    rows = soup.find_all("tr", class_="12bk")
-    LOG.debug(f"找到 {len(rows)} 行資料")
-    
-    if not rows:
-        raise RuntimeError("tbody 無 tr.12bk 資料列")
-
-    # 存儲解析結果的字典
+    # 存儲結果的字典
     result = {}
-
-    # 標記當前正在處理的產品
-    current_product = None
     
-    # 遍歷所有表格行
-    for i, tr in enumerate(rows):
-        cells = tr.find_all("td")
-        if len(cells) < 3:
+    # 遍歷所有產品單元格，找出我們要的產品
+    for product_cell in product_cells:
+        product_name_div = product_cell.find("div", align="center")
+        if not product_name_div:
             continue
-
-        # 檢查是否是新產品的開始
-        prod_cell = cells[1].get_text(strip=True)
-        if prod_cell:
-            current_product = prod_cell
-            LOG.debug(f"發現產品名稱: {current_product}")
-
-        # 如果不是目標產品，跳過
-        if current_product not in TARGETS:
-            continue
-
-        # 獲取身份別（自營商/投信/外資）
-        identity = cells[2].get_text(strip=True)
-        LOG.debug(f"處理 {current_product} - {identity}")
-        
-        # 找出正確的未平倉淨額列索引
-        # 一般是第 13 列 (索引 12)，這裡多個條件確保能正確找到
-        net_value = 0
-        
-        # 嘗試從第 13 列提取
-        try:
-            # 未平倉淨額通常在第 13 列 (索引 12)
-            net_value = _extract_net_value(tr, 12)
-            LOG.debug(f"從第 13 列提取的淨值: {net_value}")
-        except Exception as e:
-            LOG.debug(f"從第 13 列提取失敗: {e}")
             
-            # 如果失敗，嘗試從第 14 列提取
-            try:
-                net_value = _extract_net_value(tr, 13)
-                LOG.debug(f"從第 14 列提取的淨值: {net_value}")
-            except Exception as e:
-                LOG.debug(f"從第 14 列提取也失敗: {e}")
+        product_name = product_name_div.text.strip()
         
-        # 初始化該產品的記錄
-        if current_product not in result:
-            result[current_product] = {
-                "prop_net": 0,
-                "itf_net": 0,
-                "foreign_net": 0
-            }
+        # 只處理目標產品
+        if product_name not in TARGETS:
+            continue
+            
+        LOG.info(f"發現目標產品: {product_name}")
         
-        # 根據身份別存儲淨值
-        if identity == "自營商":
-            result[current_product]["prop_net"] = net_value
-        elif identity == "投信":
-            result[current_product]["itf_net"] = net_value
-        elif identity == "外資":
-            result[current_product]["foreign_net"] = net_value
-
+        # 找到產品所在的行
+        product_row = product_cell.parent
+        if not product_row:
+            LOG.warning(f"找不到產品 {product_name} 的表格行")
+            continue
+        
+        # 初始化該產品的資料
+        result[product_name] = {
+            "prop_net": 0,
+            "itf_net": 0, 
+            "foreign_net": 0,
+            "retail_net": 0
+        }
+        
+        # 處理三個連續的行（自營商、投信、外資）
+        current_row = product_row
+        
+        # 處理自營商行
+        identity_cell = current_row.find("td", class_="left_tit", attrs={"scope": "row"})
+        if identity_cell and "自營商" in identity_cell.text:
+            # 找未平倉淨額 (倒數第 3 列)
+            net_cells = current_row.find_all("td", attrs={"align": "right", "nowrap": True})
+            if len(net_cells) >= 13:
+                net_cell = net_cells[12]  # 第13個儲存格 (索引12) 是未平倉淨額-口數
+                font_tag = net_cell.find("font")
+                if font_tag:
+                    result[product_name]["prop_net"] = _clean_int(font_tag.text)
+                    LOG.info(f"{product_name} 自營商淨額: {result[product_name]['prop_net']}")
+        
+        # 處理投信行
+        current_row = current_row.find_next("tr", class_="12bk")
+        if current_row:
+            identity_cell = current_row.find("td", class_="left_tit", attrs={"scope": "row"})
+            if identity_cell and "投信" in identity_cell.text:
+                net_cells = current_row.find_all("td", attrs={"align": "right", "nowrap": True})
+                if len(net_cells) >= 13:
+                    net_cell = net_cells[12]
+                    font_tag = net_cell.find("font")
+                    if font_tag:
+                        result[product_name]["itf_net"] = _clean_int(font_tag.text)
+                        LOG.info(f"{product_name} 投信淨額: {result[product_name]['itf_net']}")
+        
+        # 處理外資行
+        current_row = current_row.find_next("tr", class_="12bk")
+        if current_row:
+            identity_cell = current_row.find("td", class_="left_tit", attrs={"scope": "row"})
+            if identity_cell and "外資" in identity_cell.text:
+                net_cells = current_row.find_all("td", attrs={"align": "right", "nowrap": True})
+                if len(net_cells) >= 13:
+                    net_cell = net_cells[12]
+                    font_tag = net_cell.find("font")
+                    if font_tag:
+                        result[product_name]["foreign_net"] = _clean_int(font_tag.text)
+                        LOG.info(f"{product_name} 外資淨額: {result[product_name]['foreign_net']}")
+        
+        # 計算散戶淨額
+        prop_net = result[product_name]["prop_net"]
+        itf_net = result[product_name]["itf_net"]
+        foreign_net = result[product_name]["foreign_net"]
+        retail_net = -(prop_net + itf_net + foreign_net)
+        result[product_name]["retail_net"] = retail_net
+        
+        LOG.info(f"{product_name} 計算散戶淨額: -({prop_net} + {itf_net} + {foreign_net}) = {retail_net}")
+    
     # 生成最終文檔列表
     docs = []
     for pname, vals in result.items():
-        # 計算散戶淨額 = -(自營商淨額 + 投信淨額 + 外資淨額)
-        retail = -(vals["prop_net"] + vals["itf_net"] + vals["foreign_net"])
-        
         docs.append({
             "date": date_obj,
             "product": TARGETS[pname],
             **vals,
-            "retail_net": retail,
         })
-        
-        # 記錄解析結果
-        LOG.info(f"{pname} 解析結果: 自營商={vals['prop_net']}, 投信={vals['itf_net']}, 外資={vals['foreign_net']}, 散戶={retail}")
     
     return date_obj, docs
 
@@ -175,7 +167,7 @@ def parse_html(html: str) -> tuple[datetime, list[dict]]:
 # ─────────────────────────── 抓取與儲存函數 ───────────────────────────
 def _is_weekend() -> bool:
     """檢查今天是否為週末"""
-    return datetime.now().weekday() >= 5       # 5,6 -> Sat, Sun
+    return datetime.now().weekday() >= 5  # 5,6 -> Sat, Sun
 
 
 def fetch(force: bool = False) -> list[dict]:
@@ -203,7 +195,7 @@ def fetch(force: bool = False) -> list[dict]:
     # 3. 保存原始 HTML 到 fut_raw_html 集合
     RAW_COL.update_one(
         {"date": date_obj},
-        {"$set": {"html_content": html_content, "fetched_at": datetime.now()}},
+        {"$set": {"html_content": html_content, "fetched_at": datetime.now(timezone.utc)}},
         upsert=True
     )
     LOG.info(f"HTML 保存成功，長度: {len(html_content)} 字符")
