@@ -1,52 +1,78 @@
 # -*- coding: utf-8 -*-
-# crawler/fut_contracts.py  v4.0  2025‑04‑19 11:05  robust index
-import re, requests, logging
+# crawler/fut_contracts.py  v4.1  2025‑04‑19
+"""抓取期交所『三大法人‐區分各期貨契約』，
+   目前僅入庫：小型臺指期貨(mtx)、微型臺指期貨(imtx)。"""
+
+from __future__ import annotations
+import re, requests, logging, argparse, pprint, sys
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from utils.db import get_col
 from pymongo import ASCENDING
 
-LOG = logging.getLogger(__name__)
-URL = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
+LOG     = logging.getLogger(__name__)
+URL     = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-COL = get_col("fut_contracts")
-COL.create_index([("product",1),("date",1)], unique=True)
 
+# ──────────────────────────────────────────
+COL = get_col("fut_contracts")
+# 保證 (product, date) 唯一
+COL.create_index([("product", 1), ("date", 1)], unique=True)
+
+# ──────────────────────────────────────────
 def _clean_int(txt: str) -> int:
+    """移除逗號、空白，轉 int。"""
     return int(re.sub(r"[^\d\-]", "", txt or "0") or 0)
 
-def _row_net(tds) -> int:
-    # 取該列所有「可能是數字」的欄位，再選最後一個
-    nums = [_clean_int(td.get_text()) for td in tds if re.search(r"[\d,]", td.text)]
-    if not nums:
-        raise ValueError("該列無數字欄位")
-    return nums[-1]
 
-def parse(html: str):
+def _row_net(tds) -> int:
+    """回傳『未平倉多空淨額‑口數』欄位值。
+       ‑ 15 欄 → index 13
+       ‑ 13 欄 → index 11
+       若欄位不足則丟例外。"""
+    idx = 13 if len(tds) == 15 else 11
+    try:
+        return _clean_int(tds[idx].get_text())
+    except IndexError:
+        raise ValueError(f"列長度={len(tds)} 無 index {idx}")
+
+
+# ──────────────────────────────────────────
+def parse(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     rows = soup.select("tbody > tr[class]")
     if not rows:
-        LOG.error("tbody rows = 0 ‑ 解析失敗")
+        LOG.error("解析失敗：tbody 無資料列")
         return []
 
-    docs = []
+    # 解析日期
+    m = re.search(r"日期\s*(\d{4}/\d{2}/\d{2})", html)
+    if not m:
+        raise RuntimeError("找不到日期字串")
+    date_obj = datetime.strptime(m.group(1), "%Y/%m/%d").replace(tzinfo=timezone.utc)
+
+    docs: list[dict] = []
     for i in range(0, len(rows), 3):
+        grp = rows[i:i + 3]
+        if len(grp) < 3:
+            continue                 # 不完整三列跳過
+
+        r_prop, r_itf, r_foreign = grp
+        prod_name = r_prop.find_all("td")[1].get_text(strip=True)
+        if prod_name not in ("小型臺指期貨", "微型臺指期貨"):
+            continue
+
+        product = "mtx" if prod_name.startswith("小型") else "imtx"
+
         try:
-            r_prop, r_itf, r_foreign = rows[i:i+3]
-        except ValueError:
+            prop_net    = _row_net(r_prop.find_all("td"))
+            itf_net     = _row_net(r_itf.find_all("td"))
+            foreign_net = _row_net(r_foreign.find_all("td"))
+        except ValueError as e:
+            LOG.warning("跳過 %s：%s", prod_name, e)
             continue
-        prod = r_prop.find_all("td")[1].get_text(strip=True)
-        if prod not in ("小型臺指期貨", "微型臺指期貨"):
-            continue
-        product = "mtx" if prod.startswith("小型") else "imtx"
 
-        prop_net    = _row_net(r_prop.find_all("td"))
-        itf_net     = _row_net(r_itf.find_all("td"))
-        foreign_net = _row_net(r_foreign.find_all("td"))
-        retail_net  = -(prop_net + itf_net + foreign_net)
-
-        date_str = soup.select_one(".h2 + table span.right").get_text(strip=True).replace("日期","")
-        date_obj = datetime.strptime(date_str, "%Y/%m/%d").replace(tzinfo=timezone.utc)
+        retail_net = -(prop_net + itf_net + foreign_net)
 
         docs.append(dict(
             date=date_obj, product=product,
@@ -55,29 +81,40 @@ def parse(html: str):
         ))
     return docs
 
-def fetch(force=False):
+
+# ──────────────────────────────────────────
+def fetch(force: bool = False) -> list[dict]:
     res = requests.get(URL, headers=HEADERS, timeout=20)
     res.raise_for_status()
     docs = parse(res.text)
     if not docs:
-        raise RuntimeError("解析結果為空")
+        raise RuntimeError("未取得任何商品資料")
 
-    ops = [dict(update_one=dict(
-        filter={"product": d["product"], "date": d["date"]},
-        update={"$set": d}, upsert=True)) for d in docs]
+    from pymongo import UpdateOne
+    ops = [UpdateOne({"product": d["product"], "date": d["date"]},
+                     {"$set": d}, upsert=True) for d in docs]
     COL.bulk_write(ops, ordered=False)
     LOG.info("upsert %d docs", len(docs))
     return docs
 
-def latest(product=None):
-    q = {"product":product} if product else {}
-    return COL.find_one(q,{"_id":0},sort=[("date",-1)])
 
+def latest(product: str | None = None):
+    """取最新一筆；product 可為 mtx / imtx"""
+    query = {"product": product} if product else {}
+    return COL.find_one(query, {"_id": 0}, sort=[("date", -1)])
+
+
+# ──────────────────────────────────────────
 if __name__ == "__main__":
-    import argparse, pprint, sys, logging, os
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
-    ap=argparse.ArgumentParser(); ap.add_argument("run"); ap.add_argument("--force",action="store_true")
-    args=ap.parse_args()
-    if args.run=="run":
-        try: pprint.pprint(fetch(args.force))
-        except Exception as e: LOG.error("crawler error %s",e); sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["run"])
+    ap.add_argument("--force", action="store_true", help="ignore weekday guard")
+    args = ap.parse_args()
+
+    if args.cmd == "run":
+        try:
+            pprint.pprint(fetch(args.force))
+        except Exception as e:
+            LOG.error("crawler error: %s", e)
+            sys.exit(1)
