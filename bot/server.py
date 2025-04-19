@@ -1,4 +1,3 @@
-# bot/server.py  ‑‑ v5.0
 import os
 import json
 import logging
