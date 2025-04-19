@@ -1,63 +1,57 @@
-# -*- coding: utf-8 -*-
-# ------------------------------------------------------------
-# bot/server.py  v1.5  2025‑04‑19 09:20  (作者：GPT‑PM)
-# 變更：
-#   • add  GET /debug?col=fut&token=<UID>  供瀏覽器直接查 DB
-# ------------------------------------------------------------
-import logging, os
-from datetime import datetime
-from flask import Flask, request, abort, jsonify
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+# bot/server.py   v2.3.0  (2025‑04‑19)
+# ==========================================================
+import os, logging, datetime as dt
+from flask import Flask, request, abort
 
-from crawler.fut_contracts import latest as fut_latest, fetch as fut_fetch
-from crawler.pc_ratio      import latest as pc_latest, fetch as pc_fetch
-from utils.db import get_col
-# ─────────────────────────────────────────────────────────────
+from linebot.v3.webhook     import WebhookHandler
+from linebot.v3.messaging   import MessagingApi, Configuration
+from linebot.v3.messaging   import ReplyMessageRequest, TextMessage
+from linebot.v3.exceptions  import InvalidSignatureError
+
+from crawler.fut_contracts  import latest as fut_latest, fetch as fut_fetch
+from crawler.pc_ratio       import latest as pc_latest
+from utils.db               import get_col
+
+# ---------- LINE & APP 初始 ----------
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_TOKEN  = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+ADMIN_USER_IDS      = set(os.environ.get("ADMIN_USER_IDS", "").split(","))  # 多個用半形逗號
+
 app      = Flask(__name__)
-line_api = LineBotApi(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
-handler  = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
+handler  = WebhookHandler(LINE_CHANNEL_SECRET)
+cfg      = Configuration(access_token=LINE_CHANNEL_TOKEN)
+line_api = MessagingApi(cfg)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-LOGGER     = logging.getLogger(__name__)
-ADMIN_IDS  = set(filter(None, os.getenv("ADMIN_USER_IDS", "").split(",")))
-# ───────────────────────── utils ─────────────────────────────
+# ---------- Mongo ----------
+COL_FUT  = get_col("fut_contracts")
+
+# ---------- 工具 ----------
+def fmt_num(n: int) -> str:
+    return f"{n:+,}"
+
 def safe_latest(prod: str) -> str:
-    doc = fut_latest(prod)
-    val = doc.get("retail_net", 0) if doc else 0
-    return f"{'+' if val>=0 else ''}{val:,}"
+    doc = fut_latest(prod)       # 不帶參數→回單筆或 None
+    if not doc:
+        return "–"
+    return fmt_num(doc["retail_net"])
 
 def build_report() -> str:
-    pc_raw = pc_latest()
-    pc_doc = pc_raw[0] if isinstance(pc_raw, list) else pc_raw or {}
-
-    pc_ratio = pc_doc.get("pc_oi_ratio", "–")
-    date_obj = pc_doc.get("date")
-    today    = date_obj.strftime("%Y/%m/%d (%a)") if isinstance(date_obj, datetime) else "—"
+    today  = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y/%m/%d (%a)")
+    pc_doc = pc_latest() or {}
+    pc     = pc_doc.get("pc_oi_ratio", "–")
 
     return (
         f"日期：{today}\n"
-        f"🧮 PC ratio 未平倉比：{pc_ratio}\n\n"
+        f"🧮 PC ratio 未平倉比：{pc}\n\n"
         f"💼 散戶未平倉（口數）\n"
         f"小台：{safe_latest('mtx')}\n"
         f"微台：{safe_latest('imtx')}"
     )
-# ───────────────────────── HTTP GET /debug ──────────────────
-@app.route("/debug")
-def http_debug():
-    """GET /debug?col=fut&token=<UID>  僅限管理員"""
-    uid  = request.args.get("token", "")
-    col  = request.args.get("col", "fut_contracts")
-    if uid not in ADMIN_IDS:
-        return jsonify({"error": "unauthorized"}), 401
 
-    docs = list(get_col(col).find({}, {"_id": 0}).sort("date", -1).limit(10))
-    return jsonify(docs)
-# ───────────────────────── webhook ───────────────────────────
+# ---------- LINE Webhook ----------
 @app.route("/callback", methods=["POST"])
 def callback():
-    sig  = request.headers["X-Line-Signature"]
+    sig  = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, sig)
@@ -65,28 +59,67 @@ def callback():
         abort(400)
     return "OK"
 
-@handler.add(MessageEvent, message=TextMessage)
-def on_message(event: MessageEvent):
-    uid, txt = event.source.user_id, event.message.text.strip()
+# ---------- 指令處理 ----------
+@handler.add(event_type="message")
+def on_message(event):
+    if event.message.type != "text":
+        return
 
-    if txt == "/today":
-        line_api.reply_message(event.reply_token, TextSendMessage(build_report()))
+    text = event.message.text.strip().lower()
+    uid  = event.source.user_id
 
-    elif txt == "/reset_fut" and uid in ADMIN_IDS:
-        fut_fetch()
-        line_api.reply_message(event.reply_token, TextSendMessage("fut_contracts 已重新抓取"))
+    # /today -------------------------------------------------
+    if text == "/today":
+        try:
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=build_report())]
+                )
+            )
+        except Exception as e:
+            logging.exception(e)
 
-    elif txt == "/reset_pc" and uid in ADMIN_IDS:
-        pc_fetch()
-        line_api.reply_message(event.reply_token, TextSendMessage("pc_ratio 已重新抓取"))
+    # /update_fut －－當天重新抓（週末自動略過）---------------
+    elif text == "/update_fut":
+        try:
+            fut_fetch()                       # 內部會判斷週末
+            msg = "fut_contracts 已更新 ✅"
+        except RuntimeError as e:
+            msg = str(e)
+        except Exception as e:
+            logging.exception(e)
+            msg = f"更新失敗：{e}"
+        line_api.reply_message(
+            ReplyMessageRequest(reply_token=event.reply_token,
+                                messages=[TextMessage(text=msg)])
+        )
 
-    elif txt.startswith("/debug") and uid in ADMIN_IDS:
-        col = txt.split("=",1)[-1] if "=" in txt else "fut_contracts"
-        docs = list(get_col(col).find({},{"_id":0}).sort("date",-1).limit(5))
-        line_api.reply_message(event.reply_token, TextSendMessage(str(docs)))
+    # /reset_fut －－清空後強制重抓 --------------------------
+    elif text == "/reset_fut":
+        if uid not in ADMIN_USER_IDS:
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="❌ 你沒有權限執行 /reset_fut")]
+                )
+            )
+            return
+        # 1) 清空
+        COL_FUT.drop()
+        # 2) 強制抓
+        try:
+            fut_fetch(force=True)
+            cnt = COL_FUT.count_documents({})
+            msg = f"✨ fut_contracts 已重建，現有 {cnt} 筆。"
+        except Exception as e:
+            logging.exception(e)
+            msg = f"重抓失敗：{e}"
+        line_api.reply_message(
+            ReplyMessageRequest(reply_token=event.reply_token,
+                                messages=[TextMessage(text=msg)])
+        )
 
-    else:
-        line_api.reply_message(event.reply_token, TextSendMessage("指令無效或權限不足"))
-# ───────────────────────── run ───────────────────────────────
+# ---------- 本地測試 ----------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    app.run("0.0.0.0", 5000, debug=True)
