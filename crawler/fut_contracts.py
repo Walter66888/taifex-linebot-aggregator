@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# crawler/fut_contracts.py  v4.4  2025‑04‑19
+# crawler/fut_contracts.py  v4.5  2025‑04‑19
 """
-抓『三大法人‑區分各期貨契約』：小台(mtx)、微台(imtx)
+抓『三大法人‑區分各期貨契約』：小台(mtx) / 微台(imtx)
 """
 
 from __future__ import annotations
@@ -16,36 +16,29 @@ URL      = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
 HEADERS  = {"User-Agent": "Mozilla/5.0"}
 
 COL = get_col("fut_contracts")
-COL.create_index([("product", 1), ("date", 1)], unique=True)
+COL.create_index([("product",1),("date",1)], unique=True)
 
-TARGETS = {
-    "小型臺指期貨": "mtx",
-    "微型臺指期貨": "imtx",
-}
-
+TARGETS = {"小型臺指期貨": "mtx", "微型臺指期貨": "imtx"}
 IDF_SET = {"自營商", "投信", "外資"}
 
-# ───────────────────────── helpers ──────────────────────────
+# ───────── helpers ─────────
 def _clean_int(txt: str) -> int:
     return int(re.sub(r"[^\d\-]", "", txt or "0") or 0)
 
-
-def _row_net(cells) -> int:
-    """未平倉『多空淨額‑口數』= 倒數第 2 格（14 或 15 欄皆通用）"""
+def _row_net(cells) -> int:           # 倒數第 2 格＝未平倉多空淨額‑口數
     if len(cells) < 12:
         raise ValueError("too few columns")
     return _clean_int(cells[-2].get_text())
 
-
-def _row_idf(cells) -> str | None:
-    """哪一格是 自營商 / 投信 / 外資──逐格找最保險"""
+def _row_idf(cells) -> str | None:    # 寬容比對『身份別』
     for c in cells:
         t = c.get_text(strip=True)
-        if t in IDF_SET:
-            return t
+        for key in IDF_SET:
+            if key in t:              # 使用 in 而非 ==
+                return key
     return None
 
-# ───────────────────────── parser ──────────────────────────
+# ───────── parser ─────────
 def parse(html: str) -> list[dict]:
     m = re.search(r"日期(\d{4}/\d{2}/\d{2})", html)
     if not m:
@@ -89,50 +82,48 @@ def parse(html: str) -> list[dict]:
             entry["prop_net"] = net
         elif idf == "投信":
             entry["itf_net"]  = net
-        else:                        # 外資
+        else:
             entry["foreign_net"] = net
 
-    docs: list[dict] = []
+    docs = []
     for pname, v in result.items():
-        retail = -(v["prop_net"] + v["itf_net"] + v["foreign_net"])
         docs.append({
             "date": date_obj,
             "product": TARGETS[pname],
             **v,
-            "retail_net": retail,
+            "retail_net": -(v["prop_net"] + v["itf_net"] + v["foreign_net"]),
         })
     return docs
 
-# ───────────────────────── fetch ──────────────────────────
+# ───────── fetch / util ─────────
 def _is_weekend() -> bool:
     from datetime import datetime
-    return datetime.now().weekday() >= 5    # 5,6 = Sat,Sun
+    return datetime.now().weekday() >= 5      # Sat / Sun
 
-def fetch(force: bool=False) -> list[dict]:
+def fetch(force=False):
     if _is_weekend() and not force:
-        raise RuntimeError("週末不抓 (加 --force 可強制)")
+        raise RuntimeError("週末不抓 (加 --force)")
 
     res = requests.get(URL, headers=HEADERS, timeout=20)
     res.raise_for_status()
     docs = parse(res.text)
     if not docs:
-        raise RuntimeError("未取得任何商品資料")
+        raise RuntimeError("未取得任何資料")
 
-    COL.bulk_write(
-        [UpdateOne({"product": d["product"], "date": d["date"]},
-                   {"$set": d}, upsert=True) for d in docs],
-        ordered=False
-    )
+    COL.bulk_write([
+        UpdateOne({"product": d["product"], "date": d["date"]},
+                  {"$set": d}, upsert=True)
+        for d in docs
+    ], ordered=False)
     LOG.info("upsert %d docs OK", len(docs))
     return docs
 
-def latest(product: str | None = None):
+def latest(product: str|None=None):
     q = {"product": product} if product else {}
     return COL.find_one(q, {"_id":0}, sort=[("date",-1)])
 
-# ───────────────────────── CLI ──────────────────────────
+# ───────── CLI ─────────
 if __name__ == "__main__":
-    import logging, pprint, argparse, sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["run"])
