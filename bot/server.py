@@ -1,21 +1,26 @@
-# bot/server.py  v2.3.3   (2025‑04‑19)
+# bot/server.py  v2.3.4   (2025‑04‑19)
 # ==========================================================
 import os, logging, datetime as dt
 from flask import Flask, request, abort
 
+# --- v3：送訊息 -------------------------------------------------------------
 from linebot.v3.messaging import (
     MessagingApi, Configuration, ApiClient,
     TextMessage, ReplyMessageRequest
 )
-from linebot.v3.webhooks   import MessageEvent, WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
 
+# --- v2：處理 webhook -------------------------------------------------------
+from linebot.webhook  import WebhookHandler
+from linebot.models   import MessageEvent
+from linebot.exceptions import InvalidSignatureError
+
+# --- 專案內部 ---------------------------------------------------------------
 from crawler.fut_contracts import latest as fut_latest, fetch as fut_fetch
 from crawler.pc_ratio      import latest as pc_latest
 from utils.db              import get_col
 
 
-# ---------- LINE 基本設定 ----------
+# ---------- LINE 設定 ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 ADMIN_USER_IDS      = set(filter(None, os.getenv("ADMIN_USER_IDS", "").split(",")))
@@ -32,7 +37,7 @@ app      = Flask(__name__)
 COL_FUT  = get_col("fut_contracts")
 
 
-# ---------- 小工具 ----------
+# ---------- Helper ----------
 def reply(token: str, text: str):
     req = ReplyMessageRequest(
         reply_token=token,
@@ -59,7 +64,7 @@ def build_report() -> str:
     )
 
 
-# ---------- Webhook ----------
+# ---------- Webhook 入口 ----------
 @app.route("/callback", methods=["POST"])
 def callback():
     sig  = request.headers.get("X-Line-Signature", "")
@@ -80,12 +85,12 @@ def on_message(event: MessageEvent):
     text = event.message.text.strip().lower()
     uid  = event.source.user_id
 
-    # /today -------------------------------------------------
+    # --- /today ------------------------------------------------------------
     if text == "/today":
         reply(event.reply_token, build_report())
         return
 
-    # /update_fut -------------------------------------------
+    # --- /update_fut -------------------------------------------------------
     if text == "/update_fut":
         try:
             fut_fetch()                       # 週末自動跳過
@@ -98,7 +103,7 @@ def on_message(event: MessageEvent):
         reply(event.reply_token, msg)
         return
 
-    # /reset_fut --------------------------------------------
+    # --- /reset_fut --------------------------------------------------------
     if text == "/reset_fut":
         if uid not in ADMIN_USER_IDS:
             reply(event.reply_token, "❌ 你沒有權限執行 /reset_fut")
