@@ -89,8 +89,15 @@ def fetch(upsert: bool=True) -> pd.DataFrame:
             COL.bulk_write(ops, ordered=False)
     return df
 
-def latest(days:int=1):
-    return list(COL.find({}, {"_id":0}).sort("date",-1).limit(days))
+def latest(count: int = 1):
+    """
+    取得最近 count 筆，count 預設 1
+    回傳 list；但 count==1 時就直接回傳第一筆 (dict)
+    """
+    docs = list(COL.find().sort("date", -1).limit(count))
+    if count == 1:
+        return docs[0] if docs else None
+    return docs
 
 # ── CLI ──────────────────────────────────────────────────
 if __name__ == "__main__":
