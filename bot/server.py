@@ -1,35 +1,39 @@
-# bot/server.py  v2.3.2   (2025‑04‑19)
+# bot/server.py  v2.3.3   (2025‑04‑19)
 # ==========================================================
 import os, logging, datetime as dt
 from flask import Flask, request, abort
 
-from linebot.v3.webhook     import WebhookHandler
-from linebot.v3.messaging   import (
-    MessagingApi, Configuration,
+from linebot.v3.messaging import (
+    MessagingApi, Configuration, ApiClient,
     TextMessage, ReplyMessageRequest
 )
-from linebot.v3.webhooks    import MessageEvent
-from linebot.v3.exceptions  import InvalidSignatureError
+from linebot.v3.webhooks   import MessageEvent, WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
 
-from crawler.fut_contracts  import latest as fut_latest, fetch as fut_fetch
-from crawler.pc_ratio       import latest as pc_latest
-from utils.db               import get_col
+from crawler.fut_contracts import latest as fut_latest, fetch as fut_fetch
+from crawler.pc_ratio      import latest as pc_latest
+from utils.db              import get_col
 
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_TOKEN  = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-ADMIN_USER_IDS      = set(filter(None, os.environ.get("ADMIN_USER_IDS", "").split(",")))
 
+# ---------- LINE 基本設定 ----------
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+ADMIN_USER_IDS      = set(filter(None, os.getenv("ADMIN_USER_IDS", "").split(",")))
+
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+cfg        = Configuration(access_token=LINE_CHANNEL_TOKEN)
+api_client = ApiClient(configuration=cfg)
+line_api   = MessagingApi(api_client)
+
+
+# ---------- Flask ----------
 app      = Flask(__name__)
-handler  = WebhookHandler(LINE_CHANNEL_SECRET)
-cfg      = Configuration(access_token=LINE_CHANNEL_TOKEN)
-line_api = MessagingApi(cfg)
-
 COL_FUT  = get_col("fut_contracts")
 
 
-# ---------- 工具 ----------
+# ---------- 小工具 ----------
 def reply(token: str, text: str):
-    """包一層 ReplyMessageRequest"""
     req = ReplyMessageRequest(
         reply_token=token,
         messages=[TextMessage(text=text)]
@@ -84,7 +88,7 @@ def on_message(event: MessageEvent):
     # /update_fut -------------------------------------------
     if text == "/update_fut":
         try:
-            fut_fetch()             # 週末自動跳過
+            fut_fetch()                       # 週末自動跳過
             msg = "✅ fut_contracts 已更新"
         except RuntimeError as e:
             msg = str(e)
