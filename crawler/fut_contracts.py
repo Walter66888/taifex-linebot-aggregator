@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-# crawler/fut_contracts.py  v4.5  2025‑04‑19
-"""
-抓『三大法人‑區分各期貨契約』：小台(mtx) / 微台(imtx)
-"""
-
 from __future__ import annotations
 import re, requests, argparse, logging, pprint, sys
 from datetime import datetime, timezone
@@ -15,6 +9,7 @@ LOG      = logging.getLogger(__name__)
 URL      = "https://www.taifex.com.tw/cht/3/futContractsDateExcel"
 HEADERS  = {"User-Agent": "Mozilla/5.0"}
 
+# 資料庫集合
 COL = get_col("fut_contracts")
 COL.create_index([("product",1),("date",1)], unique=True)
 
@@ -23,14 +18,17 @@ IDF_SET = {"自營商", "投信", "外資"}
 
 # ───────── helpers ─────────
 def _clean_int(txt: str) -> int:
+    """處理數字格式，去除非數字字符"""
     return int(re.sub(r"[^\d\-]", "", txt or "0") or 0)
 
-def _row_net(cells) -> int:           # 倒數第 2 格＝未平倉多空淨額‑口數
+def _row_net(cells) -> int:
+    """取『未平倉多空淨額‑口數』：行長可能 15,14,13 → index 13 / 12 / 11"""
     if len(cells) < 12:
         raise ValueError("too few columns")
     return _clean_int(cells[-2].get_text())
 
-def _row_idf(cells) -> str | None:    # 寬容比對『身份別』
+def _row_idf(cells) -> str | None:
+    """寬容比對身份別"""
     for c in cells:
         t = c.get_text(strip=True)
         for key in IDF_SET:
@@ -40,6 +38,7 @@ def _row_idf(cells) -> str | None:    # 寬容比對『身份別』
 
 # ───────── parser ─────────
 def parse(html: str) -> list[dict]:
+    """解析 HTML，抓取資料並返回格式化的字典列表"""
     m = re.search(r"日期(\d{4}/\d{2}/\d{2})", html)
     if not m:
         raise RuntimeError("找不到日期")
@@ -97,10 +96,11 @@ def parse(html: str) -> list[dict]:
 
 # ───────── fetch / util ─────────
 def _is_weekend() -> bool:
-    from datetime import datetime
+    """判斷是否是週末"""
     return datetime.now().weekday() >= 5      # Sat / Sun
 
 def fetch(force=False):
+    """抓取資料，若為週末可加 --force 來強制抓取"""
     if _is_weekend() and not force:
         raise RuntimeError("週末不抓 (加 --force)")
 
@@ -110,6 +110,7 @@ def fetch(force=False):
     if not docs:
         raise RuntimeError("未取得任何資料")
 
+    # 更新資料庫
     COL.bulk_write([
         UpdateOne({"product": d["product"], "date": d["date"]},
                   {"$set": d}, upsert=True)
@@ -119,8 +120,9 @@ def fetch(force=False):
     return docs
 
 def latest(product: str|None=None):
-    q = {"product": product} if product else {}
-    return COL.find_one(q, {"_id":0}, sort=[("date",-1)])
+    """從資料庫取得最新資料"""
+    query = {"product": product} if product else {}
+    return COL.find_one(query, {"_id": 0}, sort=[("date", -1)])
 
 # ───────── CLI ─────────
 if __name__ == "__main__":
