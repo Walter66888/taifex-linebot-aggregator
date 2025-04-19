@@ -1,19 +1,22 @@
-# crawler/fut_contracts.py  v4.4  2025‑04‑19
+# -*- coding: utf-8 -*-
+# crawler/fut_contracts.py  v4.3  2025‑04‑19
 """
-抓取『三大法人‑區分各期貨契約』：不篩選任何商品
-  ‑ 所有期貨契約會被抓取並存入資料庫。
+抓取『三大法人‑區分各期貨契約』：
+  ‑ 小型臺指期貨 (product = mtx)
+  ‑ 微型臺指期貨 (product = imtx)
 
 使用方式：
   python -m crawler.fut_contracts run             # 平日自動跳過假日
   python -m crawler.fut_contracts run --force     # 強制抓
 
 資料表：taifex.fut_contracts
-  {product,date,prop_net,itf_net,foreign_net,retail_net,raw_data}
+  {product,date,prop_net,itf_net,foreign_net,retail_net}
 """
 
 from __future__ import annotations
 import re, requests, argparse, logging, pprint, sys
 from datetime import datetime, timezone
+from collections import defaultdict
 
 from bs4 import BeautifulSoup
 from pymongo import ASCENDING, UpdateOne
@@ -25,6 +28,11 @@ HEADERS  = {"User-Agent": "Mozilla/5.0"}
 
 COL = get_col("fut_contracts")
 COL.create_index([("product", 1), ("date", 1)], unique=True)
+
+TARGETS = {
+    "小型臺指期貨": "mtx",
+    "微型臺指期貨": "imtx",
+}
 
 # ───────────────────────── internal helpers ──────────────────────────
 def _clean_int(txt: str) -> int:
@@ -70,7 +78,9 @@ def parse(html: str) -> list[dict]:
         if prod_cell_txt:
             current_product = prod_cell_txt
 
-        # 只要抓取所有商品，不做篩選
+        if current_product not in TARGETS:
+            continue                          # 只要 mtx / imtx
+
         idf = cells[2].get_text(strip=True)   # 自營商 / 投信 / 外資
         try:
             net = _row_net(cells)
@@ -80,7 +90,7 @@ def parse(html: str) -> list[dict]:
 
         entry = result.setdefault(
             current_product,
-            {"prop_net": 0, "itf_net": 0, "foreign_net": 0, "raw_data": {"column_data": []}}
+            {"prop_net": 0, "itf_net": 0, "foreign_net": 0}
         )
         if idf == "自營商":
             entry["prop_net"] = net
@@ -89,15 +99,12 @@ def parse(html: str) -> list[dict]:
         elif idf == "外資":
             entry["foreign_net"] = net
 
-        # 保存原始資料以便日後檢視
-        entry["raw_data"]["column_data"] = [cell.get_text(strip=True) for cell in cells]
-
     docs: list[dict] = []
     for pname, vals in result.items():
         retail = -(vals["prop_net"] + vals["itf_net"] + vals["foreign_net"])
         docs.append({
             "date": date_obj,
-            "product": pname,  # 儲存所有商品名稱（不過濾）
+            "product": TARGETS[pname],
             **vals,
             "retail_net": retail,
         })
