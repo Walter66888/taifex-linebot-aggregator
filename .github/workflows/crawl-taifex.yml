@@ -1,0 +1,42 @@
+name: Crawl Taifex & Seed Mongo
+
+on:
+  # 自動排程：週一~週五 07:05 UTC = 15:05 台北
+  schedule:
+    - cron: '5 7 * * 1-5'
+  workflow_dispatch:        # 手動觸發
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Crawl PC ratio  (always upsert)
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: |
+          python -m crawler.pc_ratio run --force || [[ $? == 75 ]]
+
+      - name: Crawl fut_contracts (always upsert)
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: |
+          python -m crawler.fut_contracts run --force || [[ $? == 75 ]]
+
+      # 若你想即刻把新資料 deploy 到 Render，可在這裡呼叫 Render Deploy Hook
+      # - name: Trigger Render redeploy
+      #   run: curl -X POST ${{ secrets.RENDER_DEPLOY_HOOK }}
