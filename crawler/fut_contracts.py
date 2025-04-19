@@ -69,85 +69,80 @@ def parse_html(html: str) -> tuple[datetime, list[dict]]:
     date_obj = datetime.strptime(m.group(1), "%Y/%m/%d").replace(tzinfo=timezone.utc)
     LOG.info(f"解析到日期: {date_obj.strftime('%Y/%m/%d')}")
 
-    # 找出所有包含商品名稱的表格單元格
-    product_cells = soup.find_all("td", class_="left_tit", attrs={"rowspan": "3"})
-    if not product_cells:
-        LOG.warning("找不到產品單元格")
-        raise RuntimeError("HTML結構異常：找不到產品單元格")
-    
-    LOG.info(f"找到 {len(product_cells)} 個產品單元格")
+    # 找到所有表格行
+    rows = soup.find_all("tr", class_="12bk")
+    LOG.info(f"找到 {len(rows)} 個表格行")
     
     # 存儲結果的字典
     result = {}
     
-    # 遍歷所有產品單元格，找出我們要的產品
-    for product_cell in product_cells:
-        product_name_div = product_cell.find("div", align="center")
-        if not product_name_div:
-            continue
-            
-        product_name = product_name_div.text.strip()
+    # 查找目標產品位置
+    product_indices = {}
+    for i, row in enumerate(rows):
+        for product_name in TARGETS:
+            if product_name in row.text:
+                # 檢查是否包含完整產品名稱而不是部分匹配
+                product_cell = row.find("td", class_="left_tit", attrs={"rowspan": "3"})
+                if product_cell:
+                    product_div = product_cell.find("div", align="center")
+                    if product_div and product_div.text.strip() == product_name:
+                        LOG.info(f"發現目標產品: {product_name} 在第 {i+1} 行")
+                        product_indices[product_name] = i
+                        
+                        # 初始化該產品的資料
+                        result[product_name] = {
+                            "prop_net": 0,
+                            "itf_net": 0,
+                            "foreign_net": 0,
+                            "retail_net": 0
+                        }
+    
+    # 對每個找到的產品處理三大法人資料
+    for product_name, start_index in product_indices.items():
+        # 自營商行是產品行
+        dealer_row = rows[start_index]
+        # 投信行
+        itf_row = rows[start_index + 1] if start_index + 1 < len(rows) else None
+        # 外資行
+        foreign_row = rows[start_index + 2] if start_index + 2 < len(rows) else None
         
-        # 只處理目標產品
-        if product_name not in TARGETS:
-            continue
-            
-        LOG.info(f"發現目標產品: {product_name}")
+        # 檢查每一行的身份
+        if "自營商" not in dealer_row.text:
+            LOG.warning(f"{product_name} 找不到自營商行")
+        if itf_row is None or "投信" not in itf_row.text:
+            LOG.warning(f"{product_name} 找不到投信行")
+        if foreign_row is None or "外資" not in foreign_row.text:
+            LOG.warning(f"{product_name} 找不到外資行")
         
-        # 找到產品所在的行
-        product_row = product_cell.parent
-        if not product_row:
-            LOG.warning(f"找不到產品 {product_name} 的表格行")
-            continue
+        # 用直接的方式提取淨額：尋找倒數第三個帶有font標籤的td單元格
+        # 處理自營商未平倉淨額
+        td_cells = dealer_row.find_all("td", attrs={"align": "right", "nowrap": True})
+        if len(td_cells) >= 13:
+            font_tags = td_cells[12].find_all("font")
+            if font_tags:
+                prop_net = _clean_int(font_tags[0].text)
+                result[product_name]["prop_net"] = prop_net
+                LOG.info(f"{product_name} 自營商淨額: {prop_net}")
         
-        # 初始化該產品的資料
-        result[product_name] = {
-            "prop_net": 0,
-            "itf_net": 0, 
-            "foreign_net": 0,
-            "retail_net": 0
-        }
+        # 處理投信未平倉淨額
+        if itf_row:
+            td_cells = itf_row.find_all("td", attrs={"align": "right", "nowrap": True})
+            if len(td_cells) >= 13:
+                font_tags = td_cells[12].find_all("font")
+                if font_tags:
+                    itf_net = _clean_int(font_tags[0].text)
+                    result[product_name]["itf_net"] = itf_net
+                    LOG.info(f"{product_name} 投信淨額: {itf_net}")
         
-        # 處理三個連續的行（自營商、投信、外資）
-        current_row = product_row
-        
-        # 處理自營商行
-        identity_cell = current_row.find("td", class_="left_tit", attrs={"scope": "row"})
-        if identity_cell and "自營商" in identity_cell.text:
-            # 找未平倉淨額 (倒數第 3 列)
-            all_cells = current_row.find_all("td", attrs={"align": "right", "nowrap": True})
-            if len(all_cells) >= 13:
-                net_cell = all_cells[12]  # 第13個儲存格 (索引12) 是未平倉淨額-口數
-                font_tag = net_cell.find("font")
-                if font_tag:
-                    result[product_name]["prop_net"] = _clean_int(font_tag.text)
-                    LOG.info(f"{product_name} 自營商淨額: {result[product_name]['prop_net']}")
-        
-        # 處理投信行
-        current_row = current_row.find_next("tr", class_="12bk")
-        if current_row:
-            identity_cell = current_row.find("td", class_="left_tit", attrs={"scope": "row"})
-            if identity_cell and "投信" in identity_cell.text:
-                all_cells = current_row.find_all("td", attrs={"align": "right", "nowrap": True})
-                if len(all_cells) >= 13:
-                    net_cell = all_cells[12]
-                    font_tag = net_cell.find("font")
-                    if font_tag:
-                        result[product_name]["itf_net"] = _clean_int(font_tag.text)
-                        LOG.info(f"{product_name} 投信淨額: {result[product_name]['itf_net']}")
-        
-        # 處理外資行
-        current_row = current_row.find_next("tr", class_="12bk")
-        if current_row:
-            identity_cell = current_row.find("td", class_="left_tit", attrs={"scope": "row"})
-            if identity_cell and "外資" in identity_cell.text:
-                all_cells = current_row.find_all("td", attrs={"align": "right", "nowrap": True})
-                if len(all_cells) >= 13:
-                    net_cell = all_cells[12]
-                    font_tag = net_cell.find("font")
-                    if font_tag:
-                        result[product_name]["foreign_net"] = _clean_int(font_tag.text)
-                        LOG.info(f"{product_name} 外資淨額: {result[product_name]['foreign_net']}")
+        # 處理外資未平倉淨額
+        if foreign_row:
+            td_cells = foreign_row.find_all("td", attrs={"align": "right", "nowrap": True})
+            if len(td_cells) >= 13:
+                font_tags = td_cells[12].find_all("font")
+                if font_tags:
+                    foreign_net = _clean_int(font_tags[0].text)
+                    result[product_name]["foreign_net"] = foreign_net
+                    LOG.info(f"{product_name} 外資淨額: {foreign_net}")
         
         # 計算散戶淨額
         prop_net = result[product_name]["prop_net"]
@@ -158,10 +153,9 @@ def parse_html(html: str) -> tuple[datetime, list[dict]]:
         
         LOG.info(f"{product_name} 計算散戶淨額: -({prop_net} + {itf_net} + {foreign_net}) = {retail_net}")
     
-    # 確認是否找到所有目標產品
-    missing_products = set(TARGETS.keys()) - set(result.keys())
-    if missing_products:
-        LOG.warning(f"找不到以下產品資料: {', '.join(missing_products)}")
+    # 如果沒找到任何產品，記錄一下
+    if not result:
+        LOG.warning("未找到任何目標產品")
     
     # 生成最終文檔列表
     docs = []
